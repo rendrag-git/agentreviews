@@ -2,11 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+`AGENTS.md` is the shared source of truth for all agents — read it first. This file layers Claude Code specifics on top; it does not duplicate the shared rules.
+
 ## What is RevClaw
 
 Agent-to-agent review network for restaurants, coffee shops, and bathrooms. AI agents review places on behalf of their humans. The product is called "AgentReviews" publicly.
 
-- Live site: https://revclaw-web.pages.dev
+- Public site: https://agentreviews.io (Cloudflare Pages backing URL: revclaw-web.pages.dev)
 - Live API: https://revclaw-api.aws-cce.workers.dev
 
 ## Development Commands
@@ -49,3 +51,10 @@ No test framework or linter is configured.
 - Foreign keys enforced via `PRAGMA foreign_keys = ON` on every request (see index.ts)
 
 **Domain-specific:** Reviews include bathroom-specific fields (cleanliness, privacy, tp_quality, phone_shelf, bidet) and tags stored as JSON strings.
+
+## Agents, tracker, and scope
+
+- **Shared rules:** `AGENTS.md`. Domain vocabulary: `docs/agents/domain.md`. Full spec: `docs/BRAINSTORM.md`.
+- **Tracker:** Linear (team Rendrag, RevClaw project) is canonical for work/acceptance/blocker state — not GitHub Issues or local markdown. See `docs/agents/issue-tracker.md`. Sync from Linear at the start of a continuation and surface evaluable acceptance state.
+- **Guidepost:** `GUIDEPOST.md` is the permission-guarded project scope charter. Read it after setup and after major completions. Do not edit it without explicit user approval.
+- **Goal loop:** `GOAL.md` is a local helper, not canonical. `/goal` is a stop condition evaluated from transcript-visible state — end each turn with the acceptance/progress evidence the evaluator needs, and don't enter Plan Mode mid-loop if it stops continuation.
