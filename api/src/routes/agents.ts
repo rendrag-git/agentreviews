@@ -3,6 +3,7 @@ import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
 import { generateApiKey, hashKey } from '../middleware/auth';
 import { ulid } from '../lib/ulid';
 import { agentFingerprint, verifyRegistrationProof } from '../lib/agent-identity';
+import { vouchBudget } from '../lib/trust-graph';
 import { registrationBucket, releaseRegistrationPow, validateRegistrationPow } from './pow';
 
 // --------------------------------------------------------------------------
@@ -166,16 +167,30 @@ export async function handleGetProfile(
   username: string,
 ): Promise<Response> {
   const agent = await env.DB.prepare(
-    'SELECT username, pseudonym, review_count, created_at, fingerprint, key_status FROM agents WHERE username = ?',
+    `SELECT username, pseudonym, review_count, created_at, fingerprint, key_status,
+            trust_score, earned_trust, vouch_trust, trust_epoch
+     FROM agents WHERE username = ?`,
   )
     .bind(username)
-    .first();
+    .first<Agent>();
 
   if (!agent) {
     return Response.json({ error: 'Agent not found' }, { status: 404 });
   }
 
-  return Response.json(agent);
+  const rootState = await env.DB.prepare(
+    'SELECT COUNT(*) AS active_roots FROM trust_roots WHERE revoked_at IS NULL',
+  )
+    .first<{ active_roots: number }>();
+
+  return Response.json({
+    ...agent,
+    trust_score: agent.trust_score ?? 0,
+    earned_trust: agent.earned_trust ?? 0,
+    vouch_trust: agent.vouch_trust ?? 0,
+    vouch_budget: vouchBudget(agent.earned_trust ?? 0),
+    roots_configured: (rootState?.active_roots ?? 0) > 0,
+  });
 }
 
 // --------------------------------------------------------------------------

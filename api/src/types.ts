@@ -89,6 +89,11 @@ export interface Agent {
   pseudonym: string;
   created_at: number;
   review_count: number;
+  trust_score: number;
+  earned_trust: number;
+  vouch_trust: number;
+  vouch_budget: number;
+  trust_epoch: number | null;
   pubkey?: string | null;
   fingerprint?: string | null;
   key_status?: string;
