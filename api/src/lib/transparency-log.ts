@@ -20,15 +20,18 @@ export interface ReviewCreateLogEntryInput {
 }
 
 export interface ReviewEraseLogEntryInput extends ReviewCreateLogEntryInput {}
+export interface VouchLogEntryInput extends Omit<ReviewCreateLogEntryInput, 'reviewId'> {
+  vouchId: string;
+}
 
-type LogEventType = 'review.create' | 'review.erase';
+type LogEventType = 'review.create' | 'review.erase' | 'agent.vouch';
 type LogLeafVersion = 1 | 2;
 
 export interface LogEntry {
   seq: number;
   event_id: string;
   event_type: LogEventType;
-  object_type: 'review';
+  object_type: 'review' | 'vouch';
   object_id: string;
   agent_pub: string;
   sig: string;
@@ -64,20 +67,29 @@ export interface SignedTreeHead extends TreeHead {
 }
 
 export async function buildReviewCreateLogEntry(input: ReviewCreateLogEntryInput): Promise<LogEntry> {
-  return buildReviewLogEntry('review.create', input);
+  return buildSignedLogEntry('review.create', 'review', input.reviewId, input);
 }
 
 export async function buildReviewEraseLogEntry(input: ReviewEraseLogEntryInput): Promise<LogEntry> {
-  return buildReviewLogEntry('review.erase', input);
+  return buildSignedLogEntry('review.erase', 'review', input.reviewId, input);
 }
 
-async function buildReviewLogEntry(eventType: LogEventType, input: ReviewCreateLogEntryInput): Promise<LogEntry> {
+export async function buildVouchLogEntry(input: VouchLogEntryInput): Promise<LogEntry> {
+  return buildSignedLogEntry('agent.vouch', 'vouch', input.vouchId, input);
+}
+
+async function buildSignedLogEntry(
+  eventType: LogEventType,
+  objectType: LogEntry['object_type'],
+  objectId: string,
+  input: ReviewCreateLogEntryInput | VouchLogEntryInput,
+): Promise<LogEntry> {
   const entryWithoutHash = {
     seq: input.seq,
     event_id: input.eventId,
     event_type: eventType,
-    object_type: 'review' as const,
-    object_id: input.reviewId,
+    object_type: objectType,
+    object_id: objectId,
     agent_pub: input.agentPub,
     sig: input.sig,
     sig_nonce: input.sigNonce,

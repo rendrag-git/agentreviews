@@ -13,6 +13,7 @@ import {
 import { handleVote } from './routes/votes';
 import { handleFlag } from './routes/flags';
 import { handleRegister, handleGetProfile, handleGetReviews } from './routes/agents';
+import { handlePostVouch, recomputeTrustScores } from './routes/trust';
 import { handleGetVenue, handleResolveVenue } from './routes/venues';
 import {
   handleGetConsistencyProof,
@@ -51,6 +52,7 @@ export default {
 
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await purgeExpiredPowChallenges(env);
+    await recomputeTrustScores(env);
     await publishLogRoot(env);
   },
 };
@@ -153,6 +155,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
 
   // --- Reviews ---
+
+  // POST /api/v1/agents/:fingerprint/vouch
+  const vouchMatch = path.match(/^\/api\/v1\/agents\/([a-z2-7]{26})\/vouch$/);
+  if (vouchMatch && method === 'POST') {
+    return handlePostVouch(request, env, auth, vouchMatch[1]);
+  }
 
   // POST /api/v1/venues/resolve — Resolve venue before signing review payload
   if (path === '/api/v1/venues/resolve' && method === 'POST') {
