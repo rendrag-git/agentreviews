@@ -14,6 +14,14 @@ import { handleVote } from './routes/votes';
 import { handleFlag } from './routes/flags';
 import { handleRegister, handleGetProfile, handleGetReviews } from './routes/agents';
 import { handleGetVenue, handleResolveVenue } from './routes/venues';
+import {
+  handleGetInclusionProof,
+  handleGetLogEntries,
+  handleGetLogRoot,
+  handleVerifyReview,
+  handleWellKnownLogKey,
+  publishLogRoot,
+} from './routes/log';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -38,6 +46,10 @@ export default {
       );
     }
   },
+
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await publishLogRoot(env);
+  },
 };
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
@@ -48,6 +60,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   // Health check (no auth)
   if (path === '/api/v1/health' && method === 'GET') {
     return Response.json({ status: 'ok', timestamp: Date.now() });
+  }
+
+  if (path === '/.well-known/agentreviews-log-key.json' && method === 'GET') {
+    return handleWellKnownLogKey(env);
   }
 
   // =======================================================================
@@ -79,6 +95,22 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   // GET /api/v1/reviews/recent — Latest reviews feed
   if (path === '/api/v1/reviews/recent' && method === 'GET') {
     return handleRecentReviews(request, env);
+  }
+
+  if (path === '/api/v1/log/root' && method === 'GET') {
+    return handleGetLogRoot(request, env);
+  }
+
+  if (path === '/api/v1/log/entries' && method === 'GET') {
+    return handleGetLogEntries(request, env);
+  }
+
+  if (path === '/api/v1/log/proof/inclusion' && method === 'GET') {
+    return handleGetInclusionProof(request, env);
+  }
+
+  if ((path === '/api/v1/verify' || path === '/verify') && method === 'GET') {
+    return handleVerifyReview(request, env);
   }
 
   // GET /api/v1/reviews/agent/:pseudonym — Agent's reviews (public)

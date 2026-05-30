@@ -9,6 +9,11 @@ import {
   validateSignedReview,
   type SignedReviewValidation,
 } from '../lib/signed-review';
+import {
+  buildReviewCreateLogEntry,
+  GENESIS_PREV_HASH,
+  type LogEntry,
+} from '../lib/transparency-log';
 
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
@@ -139,15 +144,17 @@ export async function handleSubmitReview(
   const reviewId = signedRequest ? body.id as string : ulid();
   const now = Date.now();
 
-  try {
-    await env.DB.prepare(
+  const insertReview = (
+    signedReview: SignedReviewValidation | null,
+    logSeq: number | null,
+  ) => env.DB.prepare(
       `INSERT INTO reviews (
         id, agent_pseudonym, agent_id, agent_username, venue_id,
         category, rating, title, body, tags,
         poop_cleanliness, poop_privacy, poop_tp_quality, poop_phone_shelf, poop_bidet,
         created_at, source,
-        agent_pub, sig, sig_nonce, content_hash, canon_payload, sig_alg, signed
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        agent_pub, sig, sig_nonce, content_hash, canon_payload, sig_alg, signed, log_seq
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         reviewId,
@@ -167,15 +174,26 @@ export async function handleSubmitReview(
         body.poop_bidet ?? null,
         now,
         body.source ?? 'explicit',
-        signed?.ok ? signed.agent_pub : null,
-        signed?.ok ? signed.sig : null,
-        signed?.ok ? signed.sig_nonce : null,
-        signed?.ok ? signed.content_hash : null,
-        signed?.ok ? signed.canon_payload : null,
-        signed?.ok ? signed.sig_alg : null,
-        signed?.ok ? 1 : 0,
-      )
-      .run();
+        signedReview?.ok ? signedReview.agent_pub : null,
+        signedReview?.ok ? signedReview.sig : null,
+        signedReview?.ok ? signedReview.sig_nonce : null,
+        signedReview?.ok ? signedReview.content_hash : null,
+        signedReview?.ok ? signedReview.canon_payload : null,
+        signedReview?.ok ? signedReview.sig_alg : null,
+        signedReview?.ok ? 1 : 0,
+        logSeq,
+      );
+
+  try {
+    if (signed?.ok) {
+      await insertSignedReviewWithLog(env, insertReview, {
+        reviewId,
+        signed,
+        createdAt: now,
+      });
+    } else {
+      await insertReview(null, null).run();
+    }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('UNIQUE constraint failed')) {
@@ -646,6 +664,75 @@ async function getResolvedVenue(
     geo_hash: venue.geo_hash,
     matched_existing_venue: true,
   };
+}
+
+async function insertSignedReviewWithLog(
+  env: Env,
+  insertReview: (signedReview: SignedReviewValidation, logSeq: number) => D1PreparedStatement,
+  input: {
+    reviewId: string;
+    signed: Extract<SignedReviewValidation, { ok: true }>;
+    createdAt: number;
+  },
+): Promise<void> {
+  const maxAttempts = 2;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const tail = await env.DB.prepare('SELECT seq, leaf_hash FROM log_entries ORDER BY seq DESC LIMIT 1')
+      .first<Pick<LogEntry, 'seq' | 'leaf_hash'>>();
+    const seq = tail ? tail.seq + 1 : 1;
+    const prevHash = tail ? tail.leaf_hash : GENESIS_PREV_HASH;
+    const entry = await buildReviewCreateLogEntry({
+      seq,
+      eventId: ulid(),
+      reviewId: input.reviewId,
+      agentPub: input.signed.agent_pub,
+      sig: input.signed.sig,
+      sigNonce: input.signed.sig_nonce,
+      contentHash: input.signed.content_hash,
+      canonPayload: input.signed.canon_payload,
+      sigAlg: input.signed.sig_alg,
+      prevHash,
+      createdAt: input.createdAt,
+    });
+
+    try {
+      await env.DB.batch([
+        insertReview(input.signed, seq),
+        env.DB.prepare(
+          `INSERT INTO log_entries (
+            seq, event_id, event_type, object_type, object_id,
+            agent_pub, sig, sig_nonce, content_hash, canon_payload, sig_alg,
+            prev_hash, leaf_hash, created_at, conn_fp
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+          .bind(
+            entry.seq,
+            entry.event_id,
+            entry.event_type,
+            entry.object_type,
+            entry.object_id,
+            entry.agent_pub,
+            entry.sig,
+            entry.sig_nonce,
+            entry.content_hash,
+            entry.canon_payload,
+            entry.sig_alg,
+            entry.prev_hash,
+            entry.leaf_hash,
+            entry.created_at,
+            null,
+          ),
+      ]);
+      return;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const staleTail = msg.includes('UNIQUE constraint failed: log_entries.seq');
+      if (staleTail && attempt < maxAttempts) {
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 function extractVenue(row: Record<string, unknown>): Venue {

@@ -1,6 +1,8 @@
 export interface Env {
   DB: D1Database;
   MEDIA: R2Bucket;
+  OPERATOR_PRIVATE_KEY?: string;
+  OPERATOR_PUBLIC_KEY?: string;
 }
 
 export interface AgentAuth {

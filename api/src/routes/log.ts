@@ -1,0 +1,291 @@
+import type { Env } from '../types';
+import { verifySignedPayload } from '../lib/signing';
+import { inclusionProof, merkleRoot, verifyInclusionProof } from '../lib/merkle';
+import { ulid } from '../lib/ulid';
+import {
+  type LogEntry,
+  type LogRoot,
+  signTreeHead,
+  verifyLogEntryHash,
+  verifyTreeHeadSignature,
+} from '../lib/transparency-log';
+
+const MAX_LOG_ENTRIES_LIMIT = 100;
+
+interface OperatorKey {
+  publicKey: string;
+  privateKey: string;
+}
+
+export async function handleWellKnownLogKey(env: Env): Promise<Response> {
+  const key = getOperatorKey(env);
+  if (!key) {
+    return Response.json({ error: 'Operator log key is not configured' }, { status: 503 });
+  }
+
+  return Response.json({
+    alg: 'Ed25519',
+    operator_pub: key.publicKey,
+  });
+}
+
+export async function handleGetLogRoot(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const treeSizeParam = url.searchParams.get('tree_size');
+
+  const root = treeSizeParam
+    ? await env.DB.prepare('SELECT * FROM log_roots WHERE tree_size = ?')
+      .bind(parseInt(treeSizeParam, 10))
+      .first<LogRoot>()
+    : await env.DB.prepare('SELECT * FROM log_roots ORDER BY tree_size DESC LIMIT 1')
+      .first<LogRoot>();
+
+  if (!root) {
+    return Response.json({ error: 'Log root not found' }, { status: 404 });
+  }
+
+  return Response.json({ root: extractRoot(root) });
+}
+
+export async function handleGetLogEntries(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const fromSeq = Math.max(1, parseInt(url.searchParams.get('from_seq') ?? '1', 10) || 1);
+  const limit = Math.min(
+    MAX_LOG_ENTRIES_LIMIT,
+    Math.max(1, parseInt(url.searchParams.get('limit') ?? '50', 10) || 50),
+  );
+
+  const result = await env.DB.prepare(
+    'SELECT * FROM log_entries WHERE seq >= ? ORDER BY seq ASC LIMIT ?',
+  )
+    .bind(fromSeq, limit)
+    .all<LogEntry>();
+
+  const entries = result.results || [];
+  return Response.json({
+    entries: entries.map(extractEntry),
+    next_seq: entries.length === limit ? entries[entries.length - 1].seq + 1 : null,
+  });
+}
+
+export async function handleGetInclusionProof(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const reviewId = url.searchParams.get('review_id');
+  if (!reviewId) {
+    return Response.json({ error: 'review_id is required' }, { status: 400 });
+  }
+
+  const proof = await inclusionProofForReview(env, reviewId);
+  if (!proof.ok) {
+    return Response.json({ error: proof.error }, { status: proof.status });
+  }
+
+  return Response.json(proof.body);
+}
+
+export async function handleVerifyReview(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const reviewId = url.searchParams.get('review_id');
+  if (!reviewId) {
+    return Response.json({ error: 'review_id is required' }, { status: 400 });
+  }
+
+  const proof = await inclusionProofForReview(env, reviewId);
+  if (!proof.ok) {
+    return Response.json({
+      review_id: reviewId,
+      logged: false,
+      verified: false,
+      error: proof.error,
+    }, { status: proof.status });
+  }
+
+  const { checks } = proof.body;
+  return Response.json({
+    review_id: reviewId,
+    logged: true,
+    verified: checks.log_entry_hash && checks.review_signature && checks.inclusion_proof && checks.root_signature,
+    checks,
+    proof: proof.body,
+  });
+}
+
+export async function publishLogRoot(env: Env, publishedAt = Date.now()): Promise<LogRoot> {
+  const result = await env.DB.prepare('SELECT leaf_hash FROM log_entries ORDER BY seq ASC').all<{ leaf_hash: string }>();
+  const leafHashes = (result.results || []).map((entry) => entry.leaf_hash);
+  const treeSize = leafHashes.length;
+
+  const existing = await env.DB.prepare('SELECT * FROM log_roots WHERE tree_size = ?')
+    .bind(treeSize)
+    .first<LogRoot>();
+  if (existing) return existing;
+
+  const rootHash = await merkleRoot(leafHashes);
+  const key = getOperatorKey(env);
+  if (!key) {
+    throw new Error('Operator log key is not configured');
+  }
+
+  const rootSig = await signTreeHead(
+    {
+      tree_size: treeSize,
+      root_hash: rootHash,
+      published_at: publishedAt,
+    },
+    key.privateKey,
+  );
+  const id = ulid();
+
+  await env.DB.prepare(
+    `INSERT INTO log_roots (
+      id, tree_size, root_hash, root_sig, sig_alg, operator_pub, published_at, anchor_proof
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, treeSize, rootHash, rootSig, 'Ed25519', key.publicKey, publishedAt, null)
+    .run();
+
+  const root = await env.DB.prepare('SELECT * FROM log_roots WHERE id = ?')
+    .bind(id)
+    .first<LogRoot>();
+  if (!root) {
+    throw new Error('Log root insert succeeded but created row was not found');
+  }
+
+  return root;
+}
+
+async function inclusionProofForReview(
+  env: Env,
+  reviewId: string,
+): Promise<{ ok: true; body: InclusionProofResponse } | { ok: false; error: string; status: number }> {
+  const entry = await env.DB.prepare(
+    'SELECT * FROM log_entries WHERE event_type = ? AND object_type = ? AND object_id = ?',
+  )
+    .bind('review.create', 'review', reviewId)
+    .first<LogEntry>();
+
+  if (!entry) {
+    return { ok: false, error: 'Review is not logged', status: 404 };
+  }
+
+  const root = await env.DB.prepare(
+    'SELECT * FROM log_roots WHERE tree_size >= ? ORDER BY tree_size DESC LIMIT 1',
+  )
+    .bind(entry.seq)
+    .first<LogRoot>();
+
+  if (!root) {
+    return { ok: false, error: 'No published log root includes this review', status: 404 };
+  }
+
+  const entriesResult = await env.DB.prepare(
+    'SELECT leaf_hash FROM log_entries WHERE seq <= ? ORDER BY seq ASC',
+  )
+    .bind(root.tree_size)
+    .all<{ leaf_hash: string }>();
+  const leafHashes = (entriesResult.results || []).map((row) => row.leaf_hash);
+  const proof = await inclusionProof(entry.seq - 1, leafHashes);
+  const checks = {
+    log_entry_hash: await verifyLogEntryHash(entry),
+    review_signature: await verifySignedPayload(
+      {
+        sigAlg: 'Ed25519',
+        signature: entry.sig,
+        contentHash: entry.content_hash,
+        canonPayload: entry.canon_payload,
+      },
+      entry.agent_pub,
+    ),
+    inclusion_proof: await verifyInclusionProof(entry.leaf_hash, entry.seq - 1, root.tree_size, proof, root.root_hash),
+    root_signature: await verifyTreeHeadSignature(
+      {
+        tree_size: root.tree_size,
+        root_hash: root.root_hash,
+        published_at: root.published_at,
+        root_sig: root.root_sig,
+      },
+      root.operator_pub,
+    ),
+  };
+
+  return {
+    ok: true,
+    body: {
+      review_id: reviewId,
+      tree_size: root.tree_size,
+      leaf_index: entry.seq - 1,
+      leaf_hash: entry.leaf_hash,
+      root_hash: root.root_hash,
+      proof,
+      hash_alg: 'SHA-256',
+      leaf_domain: 'RFC6962_LEAF_0x00',
+      node_domain: 'RFC6962_NODE_0x01',
+      entry: extractEntry(entry),
+      root: extractRoot(root),
+      checks,
+    },
+  };
+}
+
+function getOperatorKey(env: Env): OperatorKey | null {
+  if (env.OPERATOR_PRIVATE_KEY && env.OPERATOR_PUBLIC_KEY) {
+    return {
+      privateKey: env.OPERATOR_PRIVATE_KEY,
+      publicKey: env.OPERATOR_PUBLIC_KEY,
+    };
+  }
+
+  return null;
+}
+
+function extractEntry(entry: LogEntry) {
+  return {
+    seq: entry.seq,
+    event_id: entry.event_id,
+    event_type: entry.event_type,
+    object_type: entry.object_type,
+    object_id: entry.object_id,
+    agent_pub: entry.agent_pub,
+    sig: entry.sig,
+    sig_nonce: entry.sig_nonce,
+    content_hash: entry.content_hash,
+    canon_payload: entry.canon_payload,
+    sig_alg: entry.sig_alg,
+    prev_hash: entry.prev_hash,
+    leaf_hash: entry.leaf_hash,
+    created_at: entry.created_at,
+  };
+}
+
+function extractRoot(root: LogRoot) {
+  return {
+    id: root.id,
+    tree_size: root.tree_size,
+    root_hash: root.root_hash,
+    root_sig: root.root_sig,
+    sig_alg: root.sig_alg,
+    operator_pub: root.operator_pub,
+    published_at: root.published_at,
+    anchor_proof: root.anchor_proof,
+  };
+}
+
+interface InclusionProofResponse {
+  review_id: string;
+  tree_size: number;
+  leaf_index: number;
+  leaf_hash: string;
+  root_hash: string;
+  proof: string[];
+  hash_alg: 'SHA-256';
+  leaf_domain: 'RFC6962_LEAF_0x00';
+  node_domain: 'RFC6962_NODE_0x01';
+  entry: ReturnType<typeof extractEntry>;
+  root: ReturnType<typeof extractRoot>;
+  checks: {
+    log_entry_hash: boolean;
+    review_signature: boolean;
+    inclusion_proof: boolean;
+    root_signature: boolean;
+  };
+}
