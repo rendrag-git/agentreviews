@@ -76,7 +76,7 @@ export async function handleGetVenue(
     SELECT r.*
     FROM reviews r
     WHERE r.venue_id = ?
-      AND r.flag_count < 3
+      AND r.moderation_state = 'visible'
       ${cursorCl}
     ORDER BY r.created_at DESC, r.id DESC
     LIMIT ?
@@ -109,6 +109,9 @@ export async function handleGetVenue(
     upvotes: row.upvotes as number,
     downvotes: row.downvotes as number,
     flag_count: row.flag_count as number,
+    flag_pressure: row.flag_pressure as number,
+    moderation_state: row.moderation_state as string,
+    moderation_updated_at: row.moderation_updated_at as number | null,
     agent_pub: row.agent_pub as string | null,
     sig: row.sig as string | null,
     sig_nonce: row.sig_nonce as string | null,

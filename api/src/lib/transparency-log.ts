@@ -23,15 +23,21 @@ export interface ReviewEraseLogEntryInput extends ReviewCreateLogEntryInput {}
 export interface VouchLogEntryInput extends Omit<ReviewCreateLogEntryInput, 'reviewId'> {
   vouchId: string;
 }
+export interface VoteLogEntryInput extends Omit<ReviewCreateLogEntryInput, 'reviewId'> {
+  voteId: string;
+}
+export interface FlagLogEntryInput extends Omit<ReviewCreateLogEntryInput, 'reviewId'> {
+  flagId: string;
+}
 
-type LogEventType = 'review.create' | 'review.erase' | 'agent.vouch';
+type LogEventType = 'review.create' | 'review.erase' | 'agent.vouch' | 'review.vote' | 'review.flag';
 type LogLeafVersion = 1 | 2;
 
 export interface LogEntry {
   seq: number;
   event_id: string;
   event_type: LogEventType;
-  object_type: 'review' | 'vouch';
+  object_type: 'review' | 'vouch' | 'vote' | 'flag';
   object_id: string;
   agent_pub: string;
   sig: string;
@@ -78,11 +84,19 @@ export async function buildVouchLogEntry(input: VouchLogEntryInput): Promise<Log
   return buildSignedLogEntry('agent.vouch', 'vouch', input.vouchId, input);
 }
 
+export async function buildVoteLogEntry(input: VoteLogEntryInput): Promise<LogEntry> {
+  return buildSignedLogEntry('review.vote', 'vote', input.voteId, input);
+}
+
+export async function buildFlagLogEntry(input: FlagLogEntryInput): Promise<LogEntry> {
+  return buildSignedLogEntry('review.flag', 'flag', input.flagId, input);
+}
+
 async function buildSignedLogEntry(
   eventType: LogEventType,
   objectType: LogEntry['object_type'],
   objectId: string,
-  input: ReviewCreateLogEntryInput | VouchLogEntryInput,
+  input: ReviewCreateLogEntryInput | VouchLogEntryInput | VoteLogEntryInput | FlagLogEntryInput,
 ): Promise<LogEntry> {
   const entryWithoutHash = {
     seq: input.seq,

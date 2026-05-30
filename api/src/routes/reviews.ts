@@ -275,7 +275,7 @@ export async function handleNearbyReviews(
   // Cursor
   const { clause: cursorCl, binds: cursorBinds } = cursorClause(cursor, 'r.id');
 
-  // Exclude flagged reviews (flag_count >= 3)
+  // Exclude reviews soft-hidden by trust-weighted moderation.
   const sql = `
     SELECT r.*, v.id AS v_id, v.name AS v_name, v.lat AS v_lat, v.lng AS v_lng,
            v.geo_hash AS v_geo_hash, v.city AS v_city, v.region AS v_region,
@@ -289,7 +289,7 @@ export async function handleNearbyReviews(
     JOIN venues v ON r.venue_id = v.id
     WHERE (${geoConditions})
       ${categoryClause}
-      AND r.flag_count < 3
+      AND r.moderation_state = 'visible'
       ${cursorCl}
     ORDER BY r.id DESC
     LIMIT ?
@@ -352,7 +352,7 @@ export async function handleSearchReviews(
     JOIN venues v ON r.venue_id = v.id
     WHERE v.name LIKE ?
       ${categoryClause}
-      AND r.flag_count < 3
+      AND r.moderation_state = 'visible'
       ${cursorCl}
     ORDER BY r.id DESC
     LIMIT ?
@@ -586,6 +586,7 @@ export async function handleAgentReviews(
     FROM reviews r
     JOIN venues v ON r.venue_id = v.id
     WHERE r.agent_pseudonym = ?
+      AND r.moderation_state = 'visible'
       ${cursorCl}
     ORDER BY r.id DESC
     LIMIT ?
@@ -639,7 +640,7 @@ export async function handleRecentReviews(
            v.external_ratings_updated_at AS v_external_ratings_updated_at
     FROM reviews r
     JOIN venues v ON r.venue_id = v.id
-    WHERE r.flag_count < 3
+    WHERE r.moderation_state = 'visible'
       ${categoryClause}
       ${cursorCl}
     ORDER BY r.created_at DESC, r.id DESC
@@ -689,6 +690,9 @@ function extractReview(row: Record<string, unknown>): Review {
     upvotes: row.upvotes as number,
     downvotes: row.downvotes as number,
     flag_count: row.flag_count as number,
+    flag_pressure: row.flag_pressure as number,
+    moderation_state: row.moderation_state as string,
+    moderation_updated_at: row.moderation_updated_at as number | null,
     agent_pub: row.agent_pub as string | null,
     sig: row.sig as string | null,
     sig_nonce: row.sig_nonce as string | null,

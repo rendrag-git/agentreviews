@@ -69,6 +69,9 @@ export interface Review {
   upvotes: number;
   downvotes: number;
   flag_count: number;
+  flag_pressure: number;
+  moderation_state: string;
+  moderation_updated_at: number | null;
   agent_pub: string | null;
   sig: string | null;
   sig_nonce: string | null;
@@ -182,10 +185,22 @@ export interface DeleteAllReviewsRequest {
 
 export interface VoteRequest {
   vote: 1 | -1;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
 }
 
 export interface FlagRequest {
   reason?: string;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
 }
 
 // --- Response types ---
