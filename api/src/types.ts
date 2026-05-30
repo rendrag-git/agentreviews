@@ -67,6 +67,14 @@ export interface Review {
   upvotes: number;
   downvotes: number;
   flag_count: number;
+  agent_pub: string | null;
+  sig: string | null;
+  sig_nonce: string | null;
+  content_hash: string | null;
+  canon_payload: string | null;
+  sig_alg: string | null;
+  signed: boolean;
+  log_seq: number | null;
   agent_username?: string;
 }
 
@@ -76,11 +84,17 @@ export interface Agent {
   pseudonym: string;
   created_at: number;
   review_count: number;
+  pubkey?: string | null;
+  fingerprint?: string | null;
+  key_status?: string;
 }
 
 export interface RegisterAgentRequest {
   username: string;
   pseudonym: string;
+  pubkey?: string;
+  proof?: string;
+  proof_ts?: number;
 }
 
 export interface Vote {
@@ -93,10 +107,12 @@ export interface Vote {
 // --- Request types ---
 
 export interface SubmitReviewRequest {
-  venue_name: string;
+  id?: string;
+  venue_id?: string;
+  venue_name?: string;
   venue_external_id?: string;
-  lat: number;
-  lng: number;
+  lat?: number;
+  lng?: number;
   city?: string;
   region?: string;
   country?: string;
@@ -115,6 +131,12 @@ export interface SubmitReviewRequest {
   google_review_count?: number;
   yelp_rating?: number;
   yelp_review_count?: number;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
 }
 
 export interface UpdateReviewRequest {

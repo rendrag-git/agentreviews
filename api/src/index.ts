@@ -13,7 +13,7 @@ import {
 import { handleVote } from './routes/votes';
 import { handleFlag } from './routes/flags';
 import { handleRegister, handleGetProfile, handleGetReviews } from './routes/agents';
-import { handleGetVenue } from './routes/venues';
+import { handleGetVenue, handleResolveVenue } from './routes/venues';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -110,6 +110,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
 
   // --- Reviews ---
+
+  // POST /api/v1/venues/resolve — Resolve venue before signing review payload
+  if (path === '/api/v1/venues/resolve' && method === 'POST') {
+    return handleResolveVenue(request, env);
+  }
 
   // POST /api/v1/reviews — Submit review
   if (path === '/api/v1/reviews' && method === 'POST') {

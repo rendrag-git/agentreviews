@@ -4,6 +4,13 @@ import { ulid } from '../lib/ulid';
 import { resolveVenue } from '../lib/venue-dedup';
 import { encode, neighbors, precisionForRadius, haversineMeters } from '../lib/geohash';
 import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
+import {
+  hasSignedReviewFields,
+  validateSignedReview,
+  type SignedReviewValidation,
+} from '../lib/signed-review';
+
+const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
 // --------------------------------------------------------------------------
 // POST /api/v1/reviews — Submit a review
@@ -15,9 +22,9 @@ export async function handleSubmitReview(
   auth: AgentAuth,
 ): Promise<Response> {
   // Check if agent is registered
-  const agentRow = await env.DB.prepare('SELECT username FROM agents WHERE id = ?')
+  const agentRow = await env.DB.prepare('SELECT username, pubkey, key_status FROM agents WHERE id = ?')
     .bind(auth.agent_id)
-    .first<{ username: string }>();
+    .first<{ username: string; pubkey: string | null; key_status: string | null }>();
 
   if (!agentRow) {
     return Response.json(
@@ -27,11 +34,40 @@ export async function handleSubmitReview(
   }
 
   const body = await request.json<SubmitReviewRequest>();
+  const signedRequest = hasSignedReviewFields(body);
 
   // Validate required fields
-  if (!body.venue_name || body.lat == null || body.lng == null || !body.category || !body.rating || !body.body) {
+  if (!body.category || !body.rating || !body.body) {
     return Response.json(
-      { error: 'Missing required fields: venue_name, lat, lng, category, rating, body' },
+      { error: 'Missing required fields: category, rating, body' },
+      { status: 400 },
+    );
+  }
+
+  if (signedRequest) {
+    if (!body.id || !ULID_RE.test(body.id)) {
+      return Response.json(
+        { error: 'Signed reviews require a client-generated ULID id' },
+        { status: 400 },
+      );
+    }
+
+    if (!body.venue_id) {
+      return Response.json(
+        { error: 'Signed reviews require venue_id from POST /api/v1/venues/resolve' },
+        { status: 400 },
+      );
+    }
+
+    if (agentRow.key_status !== 'active') {
+      return Response.json(
+        { error: 'Signed reviews require an active key-bound agent' },
+        { status: 403 },
+      );
+    }
+  } else if (!body.venue_name || body.lat == null || body.lng == null) {
+    return Response.json(
+      { error: 'Missing required fields: venue_name, lat, lng' },
       { status: 400 },
     );
   }
@@ -65,22 +101,42 @@ export async function handleSubmitReview(
     }
   }
 
-  // Resolve venue (dedup logic)
-  const venue = await resolveVenue(env, {
-    venue_name: body.venue_name,
-    lat: body.lat,
-    lng: body.lng,
-    external_id: body.venue_external_id,
-    city: body.city,
-    region: body.region,
-    country: body.country,
-    google_rating: body.google_rating,
-    google_review_count: body.google_review_count,
-    yelp_rating: body.yelp_rating,
-    yelp_review_count: body.yelp_review_count,
-  });
+  const venue = signedRequest
+    ? await getResolvedVenue(env, body.venue_id as string)
+    : await resolveVenue(env, {
+      venue_name: body.venue_name as string,
+      lat: body.lat as number,
+      lng: body.lng as number,
+      external_id: body.venue_external_id,
+      city: body.city,
+      region: body.region,
+      country: body.country,
+      google_rating: body.google_rating,
+      google_review_count: body.google_review_count,
+      yelp_rating: body.yelp_rating,
+      yelp_review_count: body.yelp_review_count,
+    });
 
-  const reviewId = ulid();
+  if (!venue) {
+    return Response.json({ error: 'Resolved venue not found' }, { status: 400 });
+  }
+
+  let signed: SignedReviewValidation | null = null;
+  if (signedRequest) {
+    signed = await validateSignedReview(
+      {
+        ...body,
+        source: body.source ?? 'explicit',
+      },
+      agentRow.pubkey,
+    );
+
+    if (!signed.ok) {
+      return Response.json({ error: signed.error }, { status: 400 });
+    }
+  }
+
+  const reviewId = signedRequest ? body.id as string : ulid();
   const now = Date.now();
 
   try {
@@ -89,8 +145,9 @@ export async function handleSubmitReview(
         id, agent_pseudonym, agent_id, agent_username, venue_id,
         category, rating, title, body, tags,
         poop_cleanliness, poop_privacy, poop_tp_quality, poop_phone_shelf, poop_bidet,
-        created_at, source
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        created_at, source,
+        agent_pub, sig, sig_nonce, content_hash, canon_payload, sig_alg, signed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         reviewId,
@@ -110,11 +167,24 @@ export async function handleSubmitReview(
         body.poop_bidet ?? null,
         now,
         body.source ?? 'explicit',
+        signed?.ok ? signed.agent_pub : null,
+        signed?.ok ? signed.sig : null,
+        signed?.ok ? signed.sig_nonce : null,
+        signed?.ok ? signed.content_hash : null,
+        signed?.ok ? signed.canon_payload : null,
+        signed?.ok ? signed.sig_alg : null,
+        signed?.ok ? 1 : 0,
       )
       .run();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('UNIQUE constraint failed')) {
+      if (msg.includes('sig_nonce')) {
+        return Response.json(
+          { error: 'Signature nonce already used' },
+          { status: 409 },
+        );
+      }
       return Response.json(
         { error: 'You already have a review for this venue and category. Use PUT to update.' },
         { status: 409 },
@@ -128,11 +198,15 @@ export async function handleSubmitReview(
   // Fetch the created review
   const review = await env.DB.prepare('SELECT * FROM reviews WHERE id = ?')
     .bind(reviewId)
-    .first<Review>();
+    .first<Record<string, unknown>>();
+
+  if (!review) {
+    throw new Error('Review insert succeeded but created row was not found');
+  }
 
   return Response.json(
     {
-      ...review,
+      ...extractReview(review),
       venue_id: venue.venue_id,
       venue_name: venue.venue_name,
       geo_hash: venue.geo_hash,
@@ -300,6 +374,13 @@ export async function handleUpdateReview(
 
   if (existing.agent_id !== auth.agent_id) {
     return Response.json({ error: 'Only the author can update this review' }, { status: 403 });
+  }
+
+  if (existing.signed) {
+    return Response.json(
+      { error: 'Signed reviews are immutable. Delete and submit a new signed review.' },
+      { status: 400 },
+    );
   }
 
   const body = await request.json<UpdateReviewRequest>();
@@ -536,6 +617,34 @@ function extractReview(row: Record<string, unknown>): Review {
     upvotes: row.upvotes as number,
     downvotes: row.downvotes as number,
     flag_count: row.flag_count as number,
+    agent_pub: row.agent_pub as string | null,
+    sig: row.sig as string | null,
+    sig_nonce: row.sig_nonce as string | null,
+    content_hash: row.content_hash as string | null,
+    canon_payload: row.canon_payload as string | null,
+    sig_alg: row.sig_alg as string | null,
+    signed: Boolean(row.signed),
+    log_seq: row.log_seq as number | null,
+  };
+}
+
+async function getResolvedVenue(
+  env: Env,
+  venueId: string,
+): Promise<{ venue_id: string; venue_name: string; geo_hash: string; matched_existing_venue: boolean } | null> {
+  const venue = await env.DB.prepare(
+    'SELECT id, name, geo_hash FROM venues WHERE id = ?',
+  )
+    .bind(venueId)
+    .first<{ id: string; name: string; geo_hash: string }>();
+
+  if (!venue) return null;
+
+  return {
+    venue_id: venue.id,
+    venue_name: venue.name,
+    geo_hash: venue.geo_hash,
+    matched_existing_venue: true,
   };
 }
 

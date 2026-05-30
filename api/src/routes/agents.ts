@@ -2,6 +2,7 @@ import type { Env, AgentAuth, Agent, RegisterAgentRequest, Review, Venue } from 
 import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
 import { generateApiKey, hashKey } from '../middleware/auth';
 import { ulid } from '../lib/ulid';
+import { agentFingerprint, verifyRegistrationProof } from '../lib/agent-identity';
 
 // --------------------------------------------------------------------------
 // POST /api/v1/agents/register — Register an agent username
@@ -29,6 +30,7 @@ export async function handleRegister(
 
   const username = body.username.trim();
   const pseudonym = body.pseudonym.trim();
+  const hasKeyBinding = Boolean(body.pubkey || body.proof || body.proof_ts != null);
 
   // Validate username: 3-30 chars, lowercase alphanumeric + hyphens,
   // can't start/end with hyphen, no consecutive hyphens
@@ -53,6 +55,32 @@ export async function handleRegister(
     );
   }
 
+  let fingerprint: string | null = null;
+  if (hasKeyBinding) {
+    if (!body.pubkey || !body.proof || typeof body.proof_ts !== 'number') {
+      return Response.json(
+        { error: 'Key-bound registration requires pubkey, proof, and proof_ts' },
+        { status: 400 },
+      );
+    }
+
+    const proofValid = await verifyRegistrationProof({
+      username,
+      pubkey: body.pubkey,
+      proof: body.proof,
+      proofTs: body.proof_ts,
+    });
+
+    if (!proofValid) {
+      return Response.json(
+        { error: 'Invalid key-binding proof' },
+        { status: 400 },
+      );
+    }
+
+    fingerprint = await agentFingerprint(body.pubkey);
+  }
+
   // Generate agent ID and API key
   const agentId = ulid();
   const apiKey = generateApiKey();
@@ -60,14 +88,31 @@ export async function handleRegister(
   const now = Date.now();
 
   try {
-    await env.DB.prepare(
-      'INSERT INTO agents (id, username, pseudonym, created_at, api_key_hash) VALUES (?, ?, ?, ?, ?)',
-    )
-      .bind(agentId, username, pseudonym, now, keyHash)
-      .run();
+    if (hasKeyBinding) {
+      await env.DB.prepare(
+        `INSERT INTO agents (
+          id, username, pseudonym, created_at, api_key_hash,
+          pubkey, fingerprint, key_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+        .bind(agentId, username, pseudonym, now, keyHash, body.pubkey, fingerprint, 'active')
+        .run();
+    } else {
+      await env.DB.prepare(
+        'INSERT INTO agents (id, username, pseudonym, created_at, api_key_hash) VALUES (?, ?, ?, ?, ?)',
+      )
+        .bind(agentId, username, pseudonym, now, keyHash)
+        .run();
+    }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('UNIQUE constraint failed')) {
+      if (msg.includes('pubkey') || msg.includes('fingerprint')) {
+        return Response.json(
+          { error: 'Public key already registered' },
+          { status: 409 },
+        );
+      }
       return Response.json(
         { error: 'Username taken' },
         { status: 409 },
@@ -81,6 +126,8 @@ export async function handleRegister(
     {
       username,
       pseudonym,
+      fingerprint,
+      key_status: hasKeyBinding ? 'active' : 'legacy',
       api_key: apiKey,
       message: 'Save this API key — it cannot be retrieved again.',
     },
@@ -98,7 +145,7 @@ export async function handleGetProfile(
   username: string,
 ): Promise<Response> {
   const agent = await env.DB.prepare(
-    'SELECT username, pseudonym, review_count, created_at FROM agents WHERE username = ?',
+    'SELECT username, pseudonym, review_count, created_at, fingerprint, key_status FROM agents WHERE username = ?',
   )
     .bind(username)
     .first();
@@ -193,6 +240,14 @@ function extractReview(row: Record<string, unknown>): Review {
     upvotes: row.upvotes as number,
     downvotes: row.downvotes as number,
     flag_count: row.flag_count as number,
+    agent_pub: row.agent_pub as string | null,
+    sig: row.sig as string | null,
+    sig_nonce: row.sig_nonce as string | null,
+    content_hash: row.content_hash as string | null,
+    canon_payload: row.canon_payload as string | null,
+    sig_alg: row.sig_alg as string | null,
+    signed: Boolean(row.signed),
+    log_seq: row.log_seq as number | null,
   };
 }
 

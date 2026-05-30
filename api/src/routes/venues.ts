@@ -1,5 +1,53 @@
 import type { Env, Review, Venue } from '../types';
 import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
+import { resolveVenue } from '../lib/venue-dedup';
+
+// --------------------------------------------------------------------------
+// POST /api/v1/venues/resolve — Resolve or create a canonical venue id
+// --------------------------------------------------------------------------
+
+export async function handleResolveVenue(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const body = await request.json<{
+    venue_name?: string;
+    lat?: number;
+    lng?: number;
+    external_id?: string;
+    venue_external_id?: string;
+    city?: string;
+    region?: string;
+    country?: string;
+    google_rating?: number;
+    google_review_count?: number;
+    yelp_rating?: number;
+    yelp_review_count?: number;
+  }>();
+
+  if (!body.venue_name || body.lat == null || body.lng == null) {
+    return Response.json(
+      { error: 'Missing required fields: venue_name, lat, lng' },
+      { status: 400 },
+    );
+  }
+
+  const venue = await resolveVenue(env, {
+    venue_name: body.venue_name,
+    lat: body.lat,
+    lng: body.lng,
+    external_id: body.external_id ?? body.venue_external_id,
+    city: body.city,
+    region: body.region,
+    country: body.country,
+    google_rating: body.google_rating,
+    google_review_count: body.google_review_count,
+    yelp_rating: body.yelp_rating,
+    yelp_review_count: body.yelp_review_count,
+  });
+
+  return Response.json(venue);
+}
 
 // --------------------------------------------------------------------------
 // GET /api/v1/venues/:id — Single venue with reviews
@@ -61,6 +109,14 @@ export async function handleGetVenue(
     upvotes: row.upvotes as number,
     downvotes: row.downvotes as number,
     flag_count: row.flag_count as number,
+    agent_pub: row.agent_pub as string | null,
+    sig: row.sig as string | null,
+    sig_nonce: row.sig_nonce as string | null,
+    content_hash: row.content_hash as string | null,
+    canon_payload: row.canon_payload as string | null,
+    sig_alg: row.sig_alg as string | null,
+    signed: Boolean(row.signed),
+    log_seq: row.log_seq as number | null,
   }));
 
   return Response.json({

@@ -87,15 +87,39 @@ export async function verifySignedPayload(
 ): Promise<boolean> {
   if (signed.sigAlg !== SIGNATURE_ALG) return false;
 
-  const signedBytes = signingBytes(signed.canonPayload);
-  const expectedHash = bytesToBase64Url(await sha256(signedBytes));
-  if (signed.contentHash !== expectedHash) return false;
+  try {
+    const signedBytes = signingBytes(signed.canonPayload);
+    const expectedHash = bytesToBase64Url(await sha256(signedBytes));
+    if (signed.contentHash !== expectedHash) return false;
 
-  return verifyBytes(
-    base64UrlToBytes(signed.signature),
-    signedBytes,
-    base64UrlToBytes(publicKey),
-  );
+    return verifyBytes(
+      base64UrlToBytes(signed.signature),
+      signedBytes,
+      base64UrlToBytes(publicKey),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function signMessage(message: string | Uint8Array, privateKey: string): Promise<string> {
+  return bytesToBase64Url(await signBytes(messageBytes(message), privateKey));
+}
+
+export async function verifySignature(
+  publicKey: string,
+  signature: string,
+  message: string | Uint8Array,
+): Promise<boolean> {
+  try {
+    return verifyBytes(
+      base64UrlToBytes(signature),
+      messageBytes(message),
+      base64UrlToBytes(publicKey),
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function signBytes(bytes: Uint8Array, privateKey: string): Promise<Uint8Array> {
@@ -175,7 +199,7 @@ async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
 }
 
-function bytesToBase64Url(bytes: Uint8Array): string {
+export function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = '';
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
@@ -183,7 +207,7 @@ function bytesToBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
 }
 
-function base64UrlToBytes(value: string): Uint8Array {
+export function base64UrlToBytes(value: string): Uint8Array {
   const base64 = value.replaceAll('-', '+').replaceAll('_', '/');
   const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
   const binary = atob(padded);
@@ -192,4 +216,8 @@ function base64UrlToBytes(value: string): Uint8Array {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+function messageBytes(message: string | Uint8Array): Uint8Array {
+  return typeof message === 'string' ? new TextEncoder().encode(message) : message;
 }
