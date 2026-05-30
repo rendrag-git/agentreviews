@@ -3,6 +3,7 @@ import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
 import { generateApiKey, hashKey } from '../middleware/auth';
 import { ulid } from '../lib/ulid';
 import { agentFingerprint, verifyRegistrationProof } from '../lib/agent-identity';
+import { registrationBucket, releaseRegistrationPow, validateRegistrationPow } from './pow';
 
 // --------------------------------------------------------------------------
 // POST /api/v1/agents/register — Register an agent username
@@ -31,6 +32,7 @@ export async function handleRegister(
   const username = body.username.trim();
   const pseudonym = body.pseudonym.trim();
   const hasKeyBinding = Boolean(body.pubkey || body.proof || body.proof_ts != null);
+  const asnBucket = registrationBucket(request);
 
   // Validate username: 3-30 chars, lowercase alphanumeric + hyphens,
   // can't start/end with hyphen, no consecutive hyphens
@@ -81,6 +83,9 @@ export async function handleRegister(
     fingerprint = await agentFingerprint(body.pubkey);
   }
 
+  const pow = await validateRegistrationPow(env, asnBucket, body, username);
+  if (!pow.ok) return pow.response;
+
   // Generate agent ID and API key
   const agentId = ulid();
   const apiKey = generateApiKey();
@@ -88,25 +93,41 @@ export async function handleRegister(
   const now = Date.now();
 
   try {
-    if (hasKeyBinding) {
-      await env.DB.prepare(
+    const insertAgent = hasKeyBinding
+      ? env.DB.prepare(
         `INSERT INTO agents (
           id, username, pseudonym, created_at, api_key_hash,
-          pubkey, fingerprint, key_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          pubkey, fingerprint, key_status, registration_asn_bucket, pow_challenge
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-        .bind(agentId, username, pseudonym, now, keyHash, body.pubkey, fingerprint, 'active')
-        .run();
-    } else {
-      await env.DB.prepare(
-        'INSERT INTO agents (id, username, pseudonym, created_at, api_key_hash) VALUES (?, ?, ?, ?, ?)',
+        .bind(agentId, username, pseudonym, now, keyHash, body.pubkey, fingerprint, 'active', asnBucket, pow.challenge)
+      : env.DB.prepare(
+        `INSERT INTO agents (
+          id, username, pseudonym, created_at, api_key_hash,
+          registration_asn_bucket, pow_challenge
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-        .bind(agentId, username, pseudonym, now, keyHash)
-        .run();
+        .bind(agentId, username, pseudonym, now, keyHash, asnBucket, pow.challenge);
+
+    const statements = [insertAgent];
+    if (pow.challenge) {
+      statements.push(
+        env.DB.prepare('UPDATE pow_challenges SET consumed_at = ? WHERE challenge = ?')
+          .bind(now, pow.challenge),
+      );
     }
+
+    await env.DB.batch(statements);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('UNIQUE constraint failed')) {
+      if (msg.includes('pow_challenge')) {
+        return Response.json(
+          { error: 'Proof-of-work challenge already consumed' },
+          { status: 409 },
+        );
+      }
+      await releaseRegistrationPow(env, pow.challenge);
       if (msg.includes('pubkey') || msg.includes('fingerprint')) {
         return Response.json(
           { error: 'Public key already registered' },

@@ -22,6 +22,7 @@ import {
   handleWellKnownLogKey,
   publishLogRoot,
 } from './routes/log';
+import { handlePowChallenge, purgeExpiredPowChallenges } from './routes/pow';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -48,6 +49,7 @@ export default {
   },
 
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await purgeExpiredPowChallenges(env);
     await publishLogRoot(env);
   },
 };
@@ -111,6 +113,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   if ((path === '/api/v1/verify' || path === '/verify') && method === 'GET') {
     return handleVerifyReview(request, env);
+  }
+
+  if ((path === '/api/v1/pow/challenge' || path === '/pow/challenge') && method === 'GET') {
+    return handlePowChallenge(request, env);
   }
 
   // GET /api/v1/reviews/agent/:pseudonym — Agent's reviews (public)

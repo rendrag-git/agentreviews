@@ -97,6 +97,12 @@ export interface RegisterAgentRequest {
   pubkey?: string;
   proof?: string;
   proof_ts?: number;
+  pow?: {
+    challenge?: string;
+    nonce?: string;
+  };
+  pow_challenge?: string;
+  pow_nonce?: string;
 }
 
 export interface Vote {
