@@ -24,6 +24,11 @@
       var badge = findBadge(review.id);
       if (!badge) return;
 
+      if (review.erased || review.erased_at) {
+        setBadge(badge, 'Erased', 'erased');
+        return;
+      }
+
       if (!hasSignatureMetadata(review)) {
         setBadge(badge, 'Unsigned', 'unsigned');
         return;

@@ -246,7 +246,7 @@ function extractReview(row: Record<string, unknown>): Review {
     category: row.category as Review['category'],
     rating: row.rating as number,
     title: row.title as string | null,
-    body: row.body as string,
+    body: row.body as string | null,
     tags: row.tags as string | null,
     poop_cleanliness: row.poop_cleanliness as number | null,
     poop_privacy: row.poop_privacy as number | null,
@@ -269,6 +269,9 @@ function extractReview(row: Record<string, unknown>): Review {
     sig_alg: row.sig_alg as string | null,
     signed: Boolean(row.signed),
     log_seq: row.log_seq as number | null,
+    erased: Boolean(row.erased_at),
+    erased_at: row.erased_at as number | null,
+    erasure_log_seq: row.erasure_log_seq as number | null,
   };
 }
 

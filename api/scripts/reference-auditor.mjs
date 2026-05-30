@@ -49,6 +49,7 @@ async function auditPublicLog(base, previousTreeSize, selfTest) {
     root_hash: root.root_hash,
     entries_verified: entries.length,
     author_signatures_verified: audit.authorSignaturesVerified,
+    payloads_unavailable: audit.payloadsUnavailable,
     operator_signature_verified: audit.operatorSignatureVerified,
     operator_pub: root.operator_pub,
     consistency_verified: null,
@@ -87,6 +88,7 @@ async function fetchEntries(base, treeSize) {
 async function auditEntries(entries, root, expectedOperatorPub) {
   let previousLeafHash = GENESIS_PREV_HASH;
   let authorSignaturesVerified = 0;
+  let payloadsUnavailable = 0;
 
   for (const [index, entry] of entries.entries()) {
     const expectedSeq = index + 1;
@@ -103,10 +105,16 @@ async function auditEntries(entries, root, expectedOperatorPub) {
       throw new Error(`Entry ${entry.seq} leaf_hash does not match entry contents`);
     }
 
-    if (!(await verifySignedPayload(entry))) {
+    if (entry.canon_payload == null) {
+      if (entry.leaf_version !== 2) {
+        throw new Error(`Entry ${entry.seq} is missing canon_payload without a v2 leaf`);
+      }
+      payloadsUnavailable++;
+    } else if (!(await verifySignedPayload(entry))) {
       throw new Error(`Entry ${entry.seq} author signature is invalid`);
+    } else {
+      authorSignaturesVerified++;
     }
-    authorSignaturesVerified++;
 
     previousLeafHash = entry.leaf_hash;
   }
@@ -128,7 +136,7 @@ async function auditEntries(entries, root, expectedOperatorPub) {
     throw new Error('Published root operator key does not match expected operator key');
   }
 
-  return { authorSignaturesVerified, operatorSignatureVerified };
+  return { authorSignaturesVerified, payloadsUnavailable, operatorSignatureVerified };
 }
 
 async function verifyRemoteConsistency(base, oldSize, newSize) {
@@ -161,7 +169,7 @@ async function runTamperSelfTest(entries, root) {
   checks.edited = await rejectsAudit(() => {
     const copy = cloneEntries(entries);
     if (copy.length === 0) return copy;
-    copy[0].canon_payload = copy[0].canon_payload.replace('{', '{"tampered":true,');
+    copy[0] = tamperEntry(copy[0]);
     return copy;
   }, root);
 
@@ -213,6 +221,7 @@ async function getJson(url) {
 }
 
 async function verifySignedPayload(entry) {
+  if (entry.canon_payload == null) return false;
   if (entry.sig_alg !== 'Ed25519') return false;
   const signedBytes = signingBytes(entry.canon_payload);
   const expectedContentHash = bytesToBase64Url(await sha256(signedBytes));
@@ -250,7 +259,7 @@ function signingBytes(canonPayload) {
 }
 
 async function logEntryLeafHash(entry) {
-  return leafHash(canonicalize(entry, { omitNullish: true }));
+  return leafHash(canonicalize(leafMaterial(entry), { omitNullish: true }));
 }
 
 function entryWithoutLeafHash(entry) {
@@ -268,7 +277,24 @@ function entryWithoutLeafHash(entry) {
     sig_alg: entry.sig_alg,
     prev_hash: entry.prev_hash,
     created_at: entry.created_at,
+    leaf_version: entry.leaf_version,
   };
+}
+
+function leafMaterial(entry) {
+  if (entry.leaf_version === 2) {
+    const { canon_payload: _canonPayload, ...withoutPayload } = entry;
+    return withoutPayload;
+  }
+  const { leaf_version: _leafVersion, ...withoutLeafVersion } = entry;
+  return withoutLeafVersion;
+}
+
+function tamperEntry(entry) {
+  if (entry.canon_payload != null) {
+    return { ...entry, canon_payload: entry.canon_payload.replace('{', '{"tampered":true,') };
+  }
+  return { ...entry, content_hash: `${entry.content_hash}-tampered` };
 }
 
 async function leafHash(input) {

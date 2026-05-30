@@ -19,21 +19,27 @@ export interface ReviewCreateLogEntryInput {
   createdAt: number;
 }
 
+export interface ReviewEraseLogEntryInput extends ReviewCreateLogEntryInput {}
+
+type LogEventType = 'review.create' | 'review.erase';
+type LogLeafVersion = 1 | 2;
+
 export interface LogEntry {
   seq: number;
   event_id: string;
-  event_type: 'review.create';
+  event_type: LogEventType;
   object_type: 'review';
   object_id: string;
   agent_pub: string;
   sig: string;
   sig_nonce: string;
   content_hash: string;
-  canon_payload: string;
+  canon_payload: string | null;
   sig_alg: string;
   prev_hash: string;
   leaf_hash: string;
   created_at: number;
+  leaf_version?: LogLeafVersion;
 }
 
 export interface LogRoot {
@@ -58,10 +64,18 @@ export interface SignedTreeHead extends TreeHead {
 }
 
 export async function buildReviewCreateLogEntry(input: ReviewCreateLogEntryInput): Promise<LogEntry> {
+  return buildReviewLogEntry('review.create', input);
+}
+
+export async function buildReviewEraseLogEntry(input: ReviewEraseLogEntryInput): Promise<LogEntry> {
+  return buildReviewLogEntry('review.erase', input);
+}
+
+async function buildReviewLogEntry(eventType: LogEventType, input: ReviewCreateLogEntryInput): Promise<LogEntry> {
   const entryWithoutHash = {
     seq: input.seq,
     event_id: input.eventId,
-    event_type: 'review.create' as const,
+    event_type: eventType,
     object_type: 'review' as const,
     object_id: input.reviewId,
     agent_pub: input.agentPub,
@@ -72,6 +86,7 @@ export async function buildReviewCreateLogEntry(input: ReviewCreateLogEntryInput
     sig_alg: input.sigAlg,
     prev_hash: input.prevHash,
     created_at: input.createdAt,
+    leaf_version: 2 as const,
   };
 
   return {
@@ -85,7 +100,7 @@ export async function verifyLogEntryHash(entry: LogEntry): Promise<boolean> {
 }
 
 export async function logEntryLeafHash(entry: Omit<LogEntry, 'leaf_hash'>): Promise<string> {
-  return leafHash(canonicalize(entry as unknown as CanonicalJson, { omitNullish: true }));
+  return leafHash(canonicalize(leafMaterial(entry) as unknown as CanonicalJson, { omitNullish: true }));
 }
 
 export function entryWithoutLeafHash(entry: LogEntry): Omit<LogEntry, 'leaf_hash'> {
@@ -103,7 +118,18 @@ export function entryWithoutLeafHash(entry: LogEntry): Omit<LogEntry, 'leaf_hash
     sig_alg: entry.sig_alg,
     prev_hash: entry.prev_hash,
     created_at: entry.created_at,
+    leaf_version: entry.leaf_version,
   };
+}
+
+function leafMaterial(entry: Omit<LogEntry, 'leaf_hash'>): Omit<LogEntry, 'leaf_hash'> {
+  if (entry.leaf_version === 2) {
+    const { canon_payload: _canonPayload, ...withoutPayload } = entry;
+    return withoutPayload as Omit<LogEntry, 'leaf_hash'>;
+  }
+
+  const { leaf_version: _leafVersion, ...withoutLeafVersion } = entry;
+  return withoutLeafVersion as Omit<LogEntry, 'leaf_hash'>;
 }
 
 export async function signTreeHead(treeHead: TreeHead, privateKey: string): Promise<string> {

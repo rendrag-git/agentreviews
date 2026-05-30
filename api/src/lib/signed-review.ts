@@ -25,6 +25,17 @@ export interface SignedReviewInput {
   sig_alg?: string;
 }
 
+export interface SignedReviewEraseInput {
+  review_id?: string;
+  erased_content_hash?: string;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
+}
+
 export type SignedReviewValidation = {
   ok: true;
   canon_payload: string;
@@ -37,6 +48,8 @@ export type SignedReviewValidation = {
   ok: false;
   error: string;
 };
+
+export type SignedReviewEraseValidation = SignedReviewValidation;
 
 export function hasSignedReviewFields(input: SignedReviewInput): boolean {
   return Boolean(
@@ -95,8 +108,58 @@ export async function validateSignedReview(
   };
 }
 
+export async function validateSignedReviewErase(
+  input: SignedReviewEraseInput,
+  registeredPubkey: string | null,
+): Promise<SignedReviewEraseValidation> {
+  if (!input.agent_pub || !input.sig || !input.sig_nonce || !input.content_hash || !input.canon_payload || !input.sig_alg) {
+    return { ok: false, error: 'Signed review erasure requires agent_pub, sig, sig_nonce, content_hash, canon_payload, and sig_alg' };
+  }
+
+  if (input.sig_alg !== SIGNATURE_ALG) {
+    return { ok: false, error: 'Unsupported signature algorithm' };
+  }
+
+  if (!registeredPubkey || input.agent_pub !== registeredPubkey) {
+    return { ok: false, error: 'Signature public key is not bound to this agent' };
+  }
+
+  const expectedPayload = canonicalReviewErasePayload(input);
+  if (input.canon_payload !== expectedPayload) {
+    return { ok: false, error: 'Canonical erase payload does not match review fields' };
+  }
+
+  const valid = await verifySignedPayload(
+    {
+      sigAlg: SIGNATURE_ALG,
+      signature: input.sig,
+      contentHash: input.content_hash,
+      canonPayload: input.canon_payload,
+    },
+    input.agent_pub,
+  );
+
+  if (!valid) {
+    return { ok: false, error: 'Invalid review erase signature' };
+  }
+
+  return {
+    ok: true,
+    agent_pub: input.agent_pub,
+    sig: input.sig,
+    sig_nonce: input.sig_nonce,
+    content_hash: input.content_hash,
+    canon_payload: input.canon_payload,
+    sig_alg: SIGNATURE_ALG,
+  };
+}
+
 export function canonicalReviewPayload(input: SignedReviewInput): string {
   return canonicalize(reviewPayloadObject(input), { omitNullish: true });
+}
+
+export function canonicalReviewErasePayload(input: SignedReviewEraseInput): string {
+  return canonicalize(reviewErasePayloadObject(input), { omitNullish: true });
 }
 
 function reviewPayloadObject(input: SignedReviewInput): CanonicalJson {
@@ -114,6 +177,15 @@ function reviewPayloadObject(input: SignedReviewInput): CanonicalJson {
     poop_phone_shelf: input.poop_phone_shelf,
     poop_bidet: input.poop_bidet,
     source: input.source ?? 'explicit',
+    sig_nonce: input.sig_nonce,
+  };
+}
+
+function reviewErasePayloadObject(input: SignedReviewEraseInput): CanonicalJson {
+  return {
+    event_type: 'review.erase',
+    review_id: input.review_id,
+    erased_content_hash: input.erased_content_hash,
     sig_nonce: input.sig_nonce,
   };
 }

@@ -17,6 +17,7 @@ import {
 } from '../lib/transparency-log';
 
 const MAX_LOG_ENTRIES_LIMIT = 100;
+type LogEventType = LogEntry['event_type'];
 
 interface OperatorKey {
   publicKey: string;
@@ -77,11 +78,15 @@ export async function handleGetLogEntries(request: Request, env: Env): Promise<R
 export async function handleGetInclusionProof(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const reviewId = url.searchParams.get('review_id');
+  const eventType = parseLogEventType(url.searchParams.get('event_type') ?? 'review.create');
   if (!reviewId) {
     return Response.json({ error: 'review_id is required' }, { status: 400 });
   }
+  if (!eventType) {
+    return Response.json({ error: 'event_type must be review.create or review.erase' }, { status: 400 });
+  }
 
-  const proof = await inclusionProofForReview(env, reviewId);
+  const proof = await inclusionProofForReview(env, reviewId, eventType);
   if (!proof.ok) {
     return Response.json({ error: proof.error }, { status: proof.status });
   }
@@ -172,7 +177,7 @@ export async function handleVerifyReview(request: Request, env: Env): Promise<Re
     return Response.json({ error: 'review_id is required' }, { status: 400 });
   }
 
-  const proof = await inclusionProofForReview(env, reviewId);
+  const proof = await inclusionProofForReview(env, reviewId, 'review.create');
   if (!proof.ok) {
     return Response.json({
       review_id: reviewId,
@@ -183,12 +188,25 @@ export async function handleVerifyReview(request: Request, env: Env): Promise<Re
   }
 
   const { checks } = proof.body;
+  const review = await env.DB.prepare('SELECT erased_at, erasure_log_seq FROM reviews WHERE id = ?')
+    .bind(reviewId)
+    .first<{ erased_at: number | null; erasure_log_seq: number | null }>();
+  const erased = Boolean(review?.erased_at);
+  const eraseProof = erased ? await inclusionProofForReview(env, reviewId, 'review.erase') : null;
   return Response.json({
     review_id: reviewId,
     logged: true,
-    verified: checks.log_entry_hash && checks.review_signature && checks.inclusion_proof && checks.root_signature,
+    erased,
+    payload_available: proof.body.payload_available,
+    erase_logged: eraseProof?.ok ?? false,
+    verified: checks.log_entry_hash &&
+      checks.review_signature !== false &&
+      checks.inclusion_proof &&
+      checks.root_signature &&
+      (!erased || eraseProof?.ok === true),
     checks,
     proof: proof.body,
+    erasure: eraseProof?.ok ? eraseProof.body : null,
   });
 }
 
@@ -203,6 +221,10 @@ function parseTreeSize(value: string | null): number | null {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) return null;
   return parsed;
+}
+
+function parseLogEventType(value: string): LogEventType | null {
+  return value === 'review.create' || value === 'review.erase' ? value : null;
 }
 
 export async function publishLogRoot(env: Env, publishedAt = Date.now()): Promise<LogRoot> {
@@ -252,15 +274,16 @@ export async function publishLogRoot(env: Env, publishedAt = Date.now()): Promis
 async function inclusionProofForReview(
   env: Env,
   reviewId: string,
+  eventType: LogEventType,
 ): Promise<{ ok: true; body: InclusionProofResponse } | { ok: false; error: string; status: number }> {
   const entry = await env.DB.prepare(
     'SELECT * FROM log_entries WHERE event_type = ? AND object_type = ? AND object_id = ?',
   )
-    .bind('review.create', 'review', reviewId)
+    .bind(eventType, 'review', reviewId)
     .first<LogEntry>();
 
   if (!entry) {
-    return { ok: false, error: 'Review is not logged', status: 404 };
+    return { ok: false, error: `${eventType} is not logged`, status: 404 };
   }
 
   const root = await env.DB.prepare(
@@ -280,9 +303,8 @@ async function inclusionProofForReview(
     .all<{ leaf_hash: string }>();
   const leafHashes = (entriesResult.results || []).map((row) => row.leaf_hash);
   const proof = await inclusionProof(entry.seq - 1, leafHashes);
-  const checks = {
-    log_entry_hash: await verifyLogEntryHash(entry),
-    review_signature: await verifySignedPayload(
+  const reviewSignature = entry.canon_payload
+    ? await verifySignedPayload(
       {
         sigAlg: 'Ed25519',
         signature: entry.sig,
@@ -290,7 +312,11 @@ async function inclusionProofForReview(
         canonPayload: entry.canon_payload,
       },
       entry.agent_pub,
-    ),
+    )
+    : null;
+  const checks = {
+    log_entry_hash: await verifyLogEntryHash(entry),
+    review_signature: reviewSignature,
     inclusion_proof: await verifyInclusionProof(entry.leaf_hash, entry.seq - 1, root.tree_size, proof, root.root_hash),
     root_signature: await verifyTreeHeadSignature(
       {
@@ -317,6 +343,7 @@ async function inclusionProofForReview(
       node_domain: 'RFC6962_NODE_0x01',
       entry: extractEntry(entry),
       root: extractRoot(root),
+      payload_available: entry.canon_payload != null,
       checks,
     },
   };
@@ -349,6 +376,7 @@ function extractEntry(entry: LogEntry) {
     prev_hash: entry.prev_hash,
     leaf_hash: entry.leaf_hash,
     created_at: entry.created_at,
+    leaf_version: entry.leaf_version ?? 1,
   };
 }
 
@@ -377,9 +405,10 @@ interface InclusionProofResponse {
   node_domain: 'RFC6962_NODE_0x01';
   entry: ReturnType<typeof extractEntry>;
   root: ReturnType<typeof extractRoot>;
+  payload_available: boolean;
   checks: {
     log_entry_hash: boolean;
-    review_signature: boolean;
+    review_signature: boolean | null;
     inclusion_proof: boolean;
     root_signature: boolean;
   };

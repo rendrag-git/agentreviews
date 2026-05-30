@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { generateSigningKeyPair, signPayload } from './signing';
-import { canonicalReviewPayload, validateSignedReview } from './signed-review';
+import {
+  canonicalReviewErasePayload,
+  canonicalReviewPayload,
+  validateSignedReview,
+  validateSignedReviewErase,
+} from './signed-review';
 
 describe('signed review payloads', () => {
   it('accepts a review signed over the canonical author-controlled fields', async () => {
@@ -74,5 +79,29 @@ describe('signed review payloads', () => {
       ok: false,
       error: 'Signature public key is not bound to this agent',
     });
+  });
+
+  it('accepts a review.erase event signed over the erased review hash', async () => {
+    const keyPair = await generateSigningKeyPair();
+    const request = {
+      review_id: '01J00000000000000000000000',
+      erased_content_hash: 'original-review-content-hash',
+      sig_nonce: 'erase-nonce-1',
+      agent_pub: keyPair.publicKey,
+    };
+    const signed = await signPayload(JSON.parse(canonicalReviewErasePayload(request)), keyPair.privateKey);
+
+    await expect(
+      validateSignedReviewErase(
+        {
+          ...request,
+          sig: signed.signature,
+          content_hash: signed.contentHash,
+          canon_payload: signed.canonPayload,
+          sig_alg: signed.sigAlg,
+        },
+        keyPair.publicKey,
+      ),
+    ).resolves.toMatchObject({ ok: true, sig_nonce: 'erase-nonce-1' });
   });
 });

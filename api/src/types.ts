@@ -1,6 +1,6 @@
 export interface Env {
   DB: D1Database;
-  MEDIA: R2Bucket;
+  MEDIA?: R2Bucket;
   OPERATOR_PRIVATE_KEY?: string;
   OPERATOR_PUBLIC_KEY?: string;
 }
@@ -54,7 +54,7 @@ export interface Review {
   category: Category;
   rating: number;
   title: string | null;
-  body: string;
+  body: string | null;
   tags: string | null;
   poop_cleanliness: number | null;
   poop_privacy: number | null;
@@ -77,6 +77,9 @@ export interface Review {
   sig_alg: string | null;
   signed: boolean;
   log_seq: number | null;
+  erased: boolean;
+  erased_at: number | null;
+  erasure_log_seq: number | null;
   agent_username?: string;
 }
 
@@ -157,6 +160,19 @@ export interface UpdateReviewRequest {
   poop_tp_quality?: number;
   poop_phone_shelf?: number;
   poop_bidet?: number;
+}
+
+export interface DeleteReviewRequest {
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
+}
+
+export interface DeleteAllReviewsRequest {
+  erasures?: DeleteReviewRequest[] | Record<string, DeleteReviewRequest>;
 }
 
 export interface VoteRequest {

@@ -1,4 +1,4 @@
-import type { Env, AgentAuth, SubmitReviewRequest, UpdateReviewRequest, Review, Venue, VALID_CATEGORIES } from '../types';
+import type { Env, AgentAuth, SubmitReviewRequest, UpdateReviewRequest, DeleteAllReviewsRequest, DeleteReviewRequest, Review, Venue, VALID_CATEGORIES } from '../types';
 import { VALID_CATEGORIES as CATEGORIES } from '../types';
 import { ulid } from '../lib/ulid';
 import { resolveVenue } from '../lib/venue-dedup';
@@ -7,10 +7,13 @@ import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
 import {
   hasSignedReviewFields,
   validateSignedReview,
+  validateSignedReviewErase,
   type SignedReviewValidation,
+  type SignedReviewEraseValidation,
 } from '../lib/signed-review';
 import {
   buildReviewCreateLogEntry,
+  buildReviewEraseLogEntry,
   GENESIS_PREV_HASH,
   type LogEntry,
 } from '../lib/transparency-log';
@@ -394,6 +397,10 @@ export async function handleUpdateReview(
     return Response.json({ error: 'Only the author can update this review' }, { status: 403 });
   }
 
+  if (existing.erased_at) {
+    return Response.json({ error: 'Erased reviews cannot be updated' }, { status: 410 });
+  }
+
   if (existing.signed) {
     return Response.json(
       { error: 'Signed reviews are immutable. Delete and submit a new signed review.' },
@@ -481,9 +488,21 @@ export async function handleDeleteReview(
     return Response.json({ error: 'Only the author can delete this review' }, { status: 403 });
   }
 
-  // Votes are cascade-deleted via ON DELETE CASCADE on the FK
-  // Delete the review — triggers handle venue stats recalculation
-  await env.DB.prepare('DELETE FROM reviews WHERE id = ?').bind(reviewId).run();
+  if (existing.erased_at) {
+    return new Response(null, { status: 204 });
+  }
+
+  const requestBody = await readOptionalJson<DeleteReviewRequest>(request);
+  if (requestBody instanceof Response) return requestBody;
+  const erase = await validateEraseRequest(existing, requestBody);
+  if (!erase.ok) {
+    return Response.json({ error: erase.error }, { status: erase.status });
+  }
+
+  const result = await eraseReviewContent(env, existing, erase.signedErase);
+  if (!result.ok) {
+    return Response.json({ error: result.error }, { status: result.status });
+  }
 
   return new Response(null, { status: 204 });
 }
@@ -497,12 +516,47 @@ export async function handleDeleteAllMyReviews(
   env: Env,
   auth: AgentAuth,
 ): Promise<Response> {
+  const requestBody = await readOptionalJson<DeleteAllReviewsRequest>(request);
+  if (requestBody instanceof Response) return requestBody;
+  const erasuresByReviewId = normalizeEraseRequests(requestBody?.erasures);
+  const reviewsResult = await env.DB.prepare(
+    'SELECT * FROM reviews WHERE agent_id = ? AND erased_at IS NULL ORDER BY id ASC',
+  )
+    .bind(auth.agent_id)
+    .all<Review>();
+  const reviews = reviewsResult.results || [];
+  const signedMissing = reviews.filter((review) => Boolean(review.signed)).filter((review) => !erasuresByReviewId.get(review.id));
+
+  if (signedMissing.length > 0) {
+    return Response.json(
+      {
+        error: 'Signed reviews require signed review.erase payloads',
+        missing_review_ids: signedMissing.map((review) => review.id),
+      },
+      { status: 400 },
+    );
+  }
+
+  const signedErasures = new Map<string, Extract<SignedReviewEraseValidation, { ok: true }>>();
+  for (const review of reviews) {
+    const erase = await validateEraseRequest(review, erasuresByReviewId.get(review.id) ?? null);
+    if (!erase.ok) {
+      return Response.json({ error: erase.error, review_id: review.id }, { status: erase.status });
+    }
+    if (erase.signedErase) {
+      signedErasures.set(review.id, erase.signedErase);
+    }
+  }
+
   // Delete all votes by this agent
   await env.DB.prepare('DELETE FROM votes WHERE agent_id = ?').bind(auth.agent_id).run();
 
-  // Delete all reviews in one query — cascade deletes remaining votes on these reviews,
-  // and triggers handle venue stats recalculation automatically
-  await env.DB.prepare('DELETE FROM reviews WHERE agent_id = ?').bind(auth.agent_id).run();
+  for (const review of reviews) {
+    const result = await eraseReviewContent(env, review, signedErasures.get(review.id) ?? null);
+    if (!result.ok) {
+      return Response.json({ error: result.error, review_id: review.id }, { status: result.status });
+    }
+  }
 
   return new Response(null, { status: 204 });
 }
@@ -620,7 +674,7 @@ function extractReview(row: Record<string, unknown>): Review {
     category: row.category as Review['category'],
     rating: row.rating as number,
     title: row.title as string | null,
-    body: row.body as string,
+    body: row.body as string | null,
     tags: row.tags as string | null,
     poop_cleanliness: row.poop_cleanliness as number | null,
     poop_privacy: row.poop_privacy as number | null,
@@ -643,6 +697,9 @@ function extractReview(row: Record<string, unknown>): Review {
     sig_alg: row.sig_alg as string | null,
     signed: Boolean(row.signed),
     log_seq: row.log_seq as number | null,
+    erased: Boolean(row.erased_at),
+    erased_at: row.erased_at as number | null,
+    erasure_log_seq: row.erasure_log_seq as number | null,
   };
 }
 
@@ -698,30 +755,7 @@ async function insertSignedReviewWithLog(
     try {
       await env.DB.batch([
         insertReview(input.signed, seq),
-        env.DB.prepare(
-          `INSERT INTO log_entries (
-            seq, event_id, event_type, object_type, object_id,
-            agent_pub, sig, sig_nonce, content_hash, canon_payload, sig_alg,
-            prev_hash, leaf_hash, created_at, conn_fp
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-          .bind(
-            entry.seq,
-            entry.event_id,
-            entry.event_type,
-            entry.object_type,
-            entry.object_id,
-            entry.agent_pub,
-            entry.sig,
-            entry.sig_nonce,
-            entry.content_hash,
-            entry.canon_payload,
-            entry.sig_alg,
-            entry.prev_hash,
-            entry.leaf_hash,
-            entry.created_at,
-            null,
-          ),
+        insertLogEntryStatement(env, entry),
       ]);
       return;
     } catch (err: unknown) {
@@ -732,6 +766,222 @@ async function insertSignedReviewWithLog(
       }
       throw err;
     }
+  }
+}
+
+async function eraseReviewContent(
+  env: Env,
+  review: Review,
+  signedErase: Extract<SignedReviewEraseValidation, { ok: true }> | null,
+): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
+  const photoKeys = parsePhotoKeys(review.photo_keys);
+  if (photoKeys.length > 0) {
+    if (!env.MEDIA) {
+      return { ok: false, error: 'Media bucket is not configured for photo erasure', status: 503 };
+    }
+    await Promise.all(photoKeys.map((key) => env.MEDIA?.delete(key)));
+  }
+
+  if (!review.signed || !signedErase) {
+    const now = Date.now();
+    await env.DB.batch([
+      eraseReviewProjectionStatement(env, review.id, now, null),
+      env.DB.prepare('DELETE FROM votes WHERE review_id = ?').bind(review.id),
+    ]);
+    return { ok: true };
+  }
+
+  const createEntry = await env.DB.prepare(
+    'SELECT leaf_version FROM log_entries WHERE event_type = ? AND object_type = ? AND object_id = ?',
+  )
+    .bind('review.create', 'review', review.id)
+    .first<{ leaf_version: number | null }>();
+  if (!createEntry) {
+    return { ok: false, error: 'Signed review is missing its create log entry', status: 409 };
+  }
+  if (createEntry.leaf_version !== 2) {
+    return { ok: false, error: 'Signed review was logged with a non-erasable v1 leaf', status: 409 };
+  }
+
+  const maxAttempts = 2;
+  const now = Date.now();
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const tail = await env.DB.prepare('SELECT seq, leaf_hash FROM log_entries ORDER BY seq DESC LIMIT 1')
+      .first<Pick<LogEntry, 'seq' | 'leaf_hash'>>();
+    const seq = tail ? tail.seq + 1 : 1;
+    const prevHash = tail ? tail.leaf_hash : GENESIS_PREV_HASH;
+    const entry = await buildReviewEraseLogEntry({
+      seq,
+      eventId: ulid(),
+      reviewId: review.id,
+      agentPub: signedErase.agent_pub,
+      sig: signedErase.sig,
+      sigNonce: signedErase.sig_nonce,
+      contentHash: signedErase.content_hash,
+      canonPayload: signedErase.canon_payload,
+      sigAlg: signedErase.sig_alg,
+      prevHash,
+      createdAt: now,
+    });
+
+    try {
+      await env.DB.batch([
+        eraseReviewProjectionStatement(env, review.id, now, seq),
+        env.DB.prepare(
+          `UPDATE log_entries
+           SET canon_payload = NULL
+           WHERE event_type = ? AND object_type = ? AND object_id = ? AND leaf_version = ?`,
+        )
+          .bind('review.create', 'review', review.id, 2),
+        insertLogEntryStatement(env, entry),
+        env.DB.prepare('DELETE FROM votes WHERE review_id = ?').bind(review.id),
+      ]);
+      return { ok: true };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const staleTail = msg.includes('UNIQUE constraint failed: log_entries.seq');
+      if (staleTail && attempt < maxAttempts) {
+        continue;
+      }
+      if (msg.includes('idx_log_entries_object_event')) {
+        return { ok: false, error: 'Review erase event is already logged', status: 409 };
+      }
+      throw err;
+    }
+  }
+
+  return { ok: false, error: 'Could not append review.erase event', status: 409 };
+}
+
+function eraseReviewProjectionStatement(
+  env: Env,
+  reviewId: string,
+  erasedAt: number,
+  erasureLogSeq: number | null,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `UPDATE reviews
+     SET title = NULL,
+         body = NULL,
+         tags = NULL,
+         poop_cleanliness = NULL,
+         poop_privacy = NULL,
+         poop_tp_quality = NULL,
+         poop_phone_shelf = NULL,
+         poop_bidet = NULL,
+         photo_keys = NULL,
+         canon_payload = NULL,
+         erased_at = ?,
+         erasure_log_seq = ?,
+         updated_at = ?
+     WHERE id = ? AND erased_at IS NULL`,
+  )
+    .bind(erasedAt, erasureLogSeq, erasedAt, reviewId);
+}
+
+function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO log_entries (
+      seq, event_id, event_type, object_type, object_id,
+      agent_pub, sig, sig_nonce, content_hash, canon_payload, sig_alg,
+      prev_hash, leaf_hash, created_at, conn_fp, leaf_version
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      entry.seq,
+      entry.event_id,
+      entry.event_type,
+      entry.object_type,
+      entry.object_id,
+      entry.agent_pub,
+      entry.sig,
+      entry.sig_nonce,
+      entry.content_hash,
+      entry.canon_payload,
+      entry.sig_alg,
+      entry.prev_hash,
+      entry.leaf_hash,
+      entry.created_at,
+      null,
+      entry.leaf_version ?? 1,
+    );
+}
+
+async function validateEraseRequest(
+  review: Review,
+  requestBody: DeleteReviewRequest | null,
+): Promise<{ ok: true; signedErase: Extract<SignedReviewEraseValidation, { ok: true }> | null } | { ok: false; error: string; status: number }> {
+  if (!review.signed) {
+    return { ok: true, signedErase: null };
+  }
+
+  if (!requestBody) {
+    return { ok: false, error: 'Signed reviews require a signed review.erase request body', status: 400 };
+  }
+
+  const validation = await validateSignedReviewErase(
+    {
+      ...requestBody,
+      review_id: review.id,
+      erased_content_hash: review.content_hash ?? undefined,
+    },
+    review.agent_pub,
+  );
+  if (!validation.ok) {
+    return { ok: false, error: validation.error, status: 400 };
+  }
+
+  return { ok: true, signedErase: validation };
+}
+
+async function readOptionalJson<T>(request: Request): Promise<T | null | Response> {
+  const text = await request.text();
+  if (!text.trim()) return null;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+}
+
+function normalizeEraseRequests(
+  erasures: DeleteAllReviewsRequest['erasures'],
+): Map<string, DeleteReviewRequest> {
+  const byReviewId = new Map<string, DeleteReviewRequest>();
+  if (!erasures) return byReviewId;
+
+  if (Array.isArray(erasures)) {
+    for (const erasure of erasures) {
+      const payload = safeJson(erasure.canon_payload);
+      if (payload?.review_id && typeof payload.review_id === 'string') {
+        byReviewId.set(payload.review_id, erasure);
+      }
+    }
+    return byReviewId;
+  }
+
+  for (const [reviewId, erasure] of Object.entries(erasures)) {
+    byReviewId.set(reviewId, erasure);
+  }
+  return byReviewId;
+}
+
+function safeJson(value: string | undefined): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function parsePhotoKeys(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
   }
 }
 
