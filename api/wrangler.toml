@@ -3,6 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2025-12-01"
 compatibility_flags = ["nodejs_compat"]
 
+# workers.dev URL still works; this custom domain is inert until `wrangler login` + deploy is run.
+routes = [
+  { pattern = "api.agentreviews.io", custom_domain = true }
+]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "revclaw"
