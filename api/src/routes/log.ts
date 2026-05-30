@@ -1,6 +1,12 @@
 import type { Env } from '../types';
 import { verifySignedPayload } from '../lib/signing';
-import { inclusionProof, merkleRoot, verifyInclusionProof } from '../lib/merkle';
+import {
+  consistencyProof,
+  inclusionProof,
+  merkleRoot,
+  verifyConsistencyProof,
+  verifyInclusionProof,
+} from '../lib/merkle';
 import { ulid } from '../lib/ulid';
 import {
   type LogEntry,
@@ -83,6 +89,82 @@ export async function handleGetInclusionProof(request: Request, env: Env): Promi
   return Response.json(proof.body);
 }
 
+export async function handleGetConsistencyProof(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const oldSize = parseTreeSize(url.searchParams.get('first') ?? url.searchParams.get('old_size'));
+  const newSize = parseTreeSize(url.searchParams.get('second') ?? url.searchParams.get('new_size'));
+
+  if (oldSize == null || newSize == null) {
+    return Response.json({ error: 'first and second are required positive integers' }, { status: 400 });
+  }
+
+  if (oldSize >= newSize) {
+    return Response.json({ error: 'first must be less than second' }, { status: 400 });
+  }
+
+  const [oldRoot, newRoot] = await Promise.all([
+    rootAtTreeSize(env, oldSize),
+    rootAtTreeSize(env, newSize),
+  ]);
+
+  if (!oldRoot || !newRoot) {
+    return Response.json({ error: 'Published log root not found for requested tree size' }, { status: 404 });
+  }
+
+  const entriesResult = await env.DB.prepare(
+    'SELECT leaf_hash FROM log_entries WHERE seq <= ? ORDER BY seq ASC',
+  )
+    .bind(newSize)
+    .all<{ leaf_hash: string }>();
+  const leafHashes = (entriesResult.results || []).map((row) => row.leaf_hash);
+  if (leafHashes.length !== newSize) {
+    return Response.json({ error: 'Log entries for requested tree size are incomplete' }, { status: 409 });
+  }
+
+  const proof = await consistencyProof(oldSize, leafHashes);
+  const checks = {
+    consistency_proof: await verifyConsistencyProof(oldSize, newSize, proof, oldRoot.root_hash, newRoot.root_hash),
+    old_root_signature: await verifyTreeHeadSignature(
+      {
+        tree_size: oldRoot.tree_size,
+        root_hash: oldRoot.root_hash,
+        published_at: oldRoot.published_at,
+        root_sig: oldRoot.root_sig,
+      },
+      oldRoot.operator_pub,
+    ),
+    new_root_signature: await verifyTreeHeadSignature(
+      {
+        tree_size: newRoot.tree_size,
+        root_hash: newRoot.root_hash,
+        published_at: newRoot.published_at,
+        root_sig: newRoot.root_sig,
+      },
+      newRoot.operator_pub,
+    ),
+  };
+
+  return Response.json({
+    first_tree_size: oldSize,
+    second_tree_size: newSize,
+    first_root_hash: oldRoot.root_hash,
+    second_root_hash: newRoot.root_hash,
+    old_size: oldSize,
+    new_size: newSize,
+    old_root_hash: oldRoot.root_hash,
+    new_root_hash: newRoot.root_hash,
+    proof,
+    hash_alg: 'SHA-256',
+    node_domain: 'RFC6962_NODE_0x01',
+    old_root: extractRoot(oldRoot),
+    new_root: extractRoot(newRoot),
+    first_root: extractRoot(oldRoot),
+    second_root: extractRoot(newRoot),
+    checks,
+    verified: checks.consistency_proof && checks.old_root_signature && checks.new_root_signature,
+  });
+}
+
 export async function handleVerifyReview(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const reviewId = url.searchParams.get('review_id');
@@ -108,6 +190,19 @@ export async function handleVerifyReview(request: Request, env: Env): Promise<Re
     checks,
     proof: proof.body,
   });
+}
+
+async function rootAtTreeSize(env: Env, treeSize: number): Promise<LogRoot | null> {
+  return env.DB.prepare('SELECT * FROM log_roots WHERE tree_size = ?')
+    .bind(treeSize)
+    .first<LogRoot>();
+}
+
+function parseTreeSize(value: string | null): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return null;
+  return parsed;
 }
 
 export async function publishLogRoot(env: Env, publishedAt = Date.now()): Promise<LogRoot> {

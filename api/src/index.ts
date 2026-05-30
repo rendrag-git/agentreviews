@@ -15,6 +15,7 @@ import { handleFlag } from './routes/flags';
 import { handleRegister, handleGetProfile, handleGetReviews } from './routes/agents';
 import { handleGetVenue, handleResolveVenue } from './routes/venues';
 import {
+  handleGetConsistencyProof,
   handleGetInclusionProof,
   handleGetLogEntries,
   handleGetLogRoot,
@@ -109,6 +110,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   if (path === '/api/v1/log/proof/inclusion' && method === 'GET') {
     return handleGetInclusionProof(request, env);
+  }
+
+  if (path === '/api/v1/log/proof/consistency' && method === 'GET') {
+    return handleGetConsistencyProof(request, env);
   }
 
   if ((path === '/api/v1/verify' || path === '/verify') && method === 'GET') {

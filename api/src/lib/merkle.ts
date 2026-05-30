@@ -38,6 +38,18 @@ export async function inclusionProof(leafIndex: number, leafHashes: string[]): P
   return auditPath(leafIndex, leafHashes);
 }
 
+export async function consistencyProof(oldSize: number, leafHashes: string[]): Promise<string[]> {
+  if (!Number.isInteger(oldSize) || oldSize < 1 || oldSize > leafHashes.length) {
+    throw new RangeError('oldSize out of range');
+  }
+
+  if (oldSize === leafHashes.length) {
+    return [];
+  }
+
+  return consistencySubproof(oldSize, leafHashes, true);
+}
+
 export async function verifyInclusionProof(
   leaf: string,
   leafIndex: number,
@@ -52,6 +64,72 @@ export async function verifyInclusionProof(
   try {
     const result = await rootFromProof(leaf, leafIndex, treeSize, proof, 0);
     return result.used === proof.length && result.hash === expectedRoot;
+  } catch {
+    return false;
+  }
+}
+
+export async function verifyConsistencyProof(
+  oldSize: number,
+  newSize: number,
+  proof: string[],
+  oldRoot: string,
+  newRoot: string,
+): Promise<boolean> {
+  if (!Number.isInteger(oldSize) || !Number.isInteger(newSize) || oldSize < 1 || newSize < oldSize) {
+    return false;
+  }
+
+  if (oldSize === newSize) {
+    return proof.length === 0 && oldRoot === newRoot;
+  }
+
+  try {
+    let fn = oldSize - 1;
+    let sn = newSize - 1;
+    while (isOdd(fn)) {
+      fn = Math.floor(fn / 2);
+      sn = Math.floor(sn / 2);
+    }
+
+    let index = 0;
+    let oldHash: string;
+    let newHash: string;
+    if (fn === 0) {
+      oldHash = oldRoot;
+      newHash = oldRoot;
+    } else {
+      const first = proof[index++];
+      if (!first) return false;
+      oldHash = first;
+      newHash = first;
+    }
+
+    while (fn !== 0) {
+      const next = proof[index++];
+      if (!next) return false;
+
+      if (isOdd(fn)) {
+        oldHash = await nodeHash(next, oldHash);
+        newHash = await nodeHash(next, newHash);
+      } else if (fn < sn) {
+        newHash = await nodeHash(newHash, next);
+      } else {
+        index--;
+      }
+
+      fn = Math.floor(fn / 2);
+      sn = Math.floor(sn / 2);
+    }
+
+    while (sn !== 0) {
+      const next = proof[index++];
+      if (!next) return false;
+      newHash = await nodeHash(newHash, next);
+      sn = Math.floor(sn / 2);
+    }
+
+    return index === proof.length && oldHash === oldRoot && newHash === newRoot;
   } catch {
     return false;
   }
@@ -74,6 +152,25 @@ export function base64UrlToBytes(value: string): Uint8Array {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+async function consistencySubproof(oldSize: number, leafHashes: string[], oldRootKnown: boolean): Promise<string[]> {
+  if (oldSize === leafHashes.length) {
+    return oldRootKnown ? [] : [await merkleRoot(leafHashes)];
+  }
+
+  const split = largestPowerOfTwoLessThan(leafHashes.length);
+  if (oldSize <= split) {
+    return [
+      ...(await consistencySubproof(oldSize, leafHashes.slice(0, split), oldRootKnown)),
+      await merkleRoot(leafHashes.slice(split)),
+    ];
+  }
+
+  return [
+    ...(await consistencySubproof(oldSize - split, leafHashes.slice(split), false)),
+    await merkleRoot(leafHashes.slice(0, split)),
+  ];
 }
 
 async function auditPath(leafIndex: number, leafHashes: string[]): Promise<string[]> {
@@ -126,6 +223,10 @@ function largestPowerOfTwoLessThan(value: number): number {
     power *= 2;
   }
   return power;
+}
+
+function isOdd(value: number): boolean {
+  return value % 2 === 1;
 }
 
 async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
