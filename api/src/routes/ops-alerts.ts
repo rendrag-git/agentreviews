@@ -19,7 +19,7 @@ interface OpsAlertRow {
 }
 
 const OPS_TOKEN_ACTOR = 'ops-token';
-const ALLOWED_ALERT_STATUSES = new Set(['open', 'dismissed']);
+const ALLOWED_ALERT_STATUSES = new Set(['open', 'dismissed', 'disputed']);
 
 export async function handleListOpsAlerts(request: Request, env: Env): Promise<Response> {
   const auth = requireOpsAuth(request, env);

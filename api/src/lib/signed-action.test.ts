@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { generateSigningKeyPair, signPayload } from './signing';
 import {
   canonicalFlagPayload,
+  canonicalDisputePayload,
   canonicalVotePayload,
+  validateSignedDispute,
   validateSignedFlag,
   validateSignedVote,
 } from './signed-action';
@@ -41,5 +43,22 @@ describe('signed vote and flag payloads', () => {
       canon_payload: signedFlag.canonPayload,
       sig_alg: signedFlag.sigAlg,
     }, keyPair.publicKey)).resolves.toMatchObject({ ok: true, sig_nonce: 'flag-nonce-1' });
+
+    const dispute = {
+      review_id: '01J00000000000000000000003',
+      alert_id: 'venue.review_bomb:venue-1:82',
+      reason: 'This is my legitimate visit',
+      sig_nonce: 'dispute-nonce-1',
+      agent_pub: keyPair.publicKey,
+    };
+    const signedDispute = await signPayload(JSON.parse(canonicalDisputePayload(dispute)), keyPair.privateKey);
+
+    await expect(validateSignedDispute({
+      ...dispute,
+      sig: signedDispute.signature,
+      content_hash: signedDispute.contentHash,
+      canon_payload: signedDispute.canonPayload,
+      sig_alg: signedDispute.sigAlg,
+    }, keyPair.publicKey)).resolves.toMatchObject({ ok: true, sig_nonce: 'dispute-nonce-1' });
   });
 });

@@ -13,6 +13,12 @@ export interface SignedFlagInput extends SignedActionFields {
   reason?: string;
 }
 
+export interface SignedDisputeInput extends SignedActionFields {
+  review_id?: string;
+  alert_id?: string;
+  reason?: string;
+}
+
 interface SignedActionFields {
   agent_pub?: string;
   sig?: string;
@@ -37,6 +43,7 @@ type SignedActionValidation = {
 
 export type SignedVoteValidation = SignedActionValidation;
 export type SignedFlagValidation = SignedActionValidation;
+export type SignedDisputeValidation = SignedActionValidation;
 
 export function hasSignedActionFields(input: SignedActionFields): boolean {
   return Boolean(input.agent_pub || input.sig || input.sig_nonce || input.content_hash || input.canon_payload || input.sig_alg);
@@ -56,6 +63,13 @@ export async function validateSignedFlag(
   return validateSignedAction(input, registeredPubkey, canonicalFlagPayload(input), 'flag');
 }
 
+export async function validateSignedDispute(
+  input: SignedDisputeInput,
+  registeredPubkey: string | null,
+): Promise<SignedDisputeValidation> {
+  return validateSignedAction(input, registeredPubkey, canonicalDisputePayload(input), 'dispute');
+}
+
 export function canonicalVotePayload(input: SignedVoteInput): string {
   return canonicalize({
     event_type: 'review.vote',
@@ -69,11 +83,15 @@ export function canonicalFlagPayload(input: SignedFlagInput): string {
   return canonicalize(flagPayloadObject(input), { omitNullish: true });
 }
 
+export function canonicalDisputePayload(input: SignedDisputeInput): string {
+  return canonicalize(disputePayloadObject(input), { omitNullish: true });
+}
+
 async function validateSignedAction(
   input: SignedActionFields,
   registeredPubkey: string | null,
   expectedPayload: string,
-  actionName: 'vote' | 'flag',
+  actionName: 'vote' | 'flag' | 'dispute',
 ): Promise<SignedActionValidation> {
   if (!input.agent_pub || !input.sig || !input.sig_nonce || !input.content_hash || !input.canon_payload || !input.sig_alg) {
     return { ok: false, error: `Signed ${actionName}s require agent_pub, sig, sig_nonce, content_hash, canon_payload, and sig_alg` };
@@ -120,6 +138,16 @@ function flagPayloadObject(input: SignedFlagInput): CanonicalJson {
   return {
     event_type: 'review.flag',
     review_id: input.review_id,
+    reason: input.reason ?? '',
+    sig_nonce: input.sig_nonce,
+  };
+}
+
+function disputePayloadObject(input: SignedDisputeInput): CanonicalJson {
+  return {
+    event_type: 'review.dispute',
+    review_id: input.review_id,
+    alert_id: input.alert_id,
     reason: input.reason ?? '',
     sig_nonce: input.sig_nonce,
   };

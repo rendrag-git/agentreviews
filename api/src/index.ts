@@ -12,6 +12,7 @@ import {
 } from './routes/reviews';
 import { handleVote } from './routes/votes';
 import { handleFlag } from './routes/flags';
+import { handleDisputeReview } from './routes/disputes';
 import { handleRegister, handleGetProfile, handleGetReviews } from './routes/agents';
 import { handlePostVouch, recomputeTrustScores } from './routes/trust';
 import { recomputeVenueScores } from './routes/scoring';
@@ -208,6 +209,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   // DELETE /api/v1/reviews/:id — Delete review
   if (reviewIdMatch && method === 'DELETE') {
     return handleDeleteReview(request, env, auth, reviewIdMatch[1]);
+  }
+
+  const disputeMatch = path.match(/^\/api\/v1\/reviews\/([^/]+)\/dispute$/);
+  if (disputeMatch && method === 'POST') {
+    return handleDisputeReview(request, env, auth, decodeURIComponent(disputeMatch[1]));
   }
 
   // --- Votes ---

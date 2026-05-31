@@ -211,6 +211,17 @@ export interface FlagRequest {
   sig_alg?: string;
 }
 
+export interface DisputeReviewRequest {
+  alert_id?: string;
+  reason?: string;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
+}
+
 // --- Response types ---
 
 export interface PaginatedResponse<T> {

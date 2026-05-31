@@ -85,6 +85,7 @@ describe('ops alert triage', () => {
         mitigation_count: 3,
       }),
       alert({ id: 'dismissed', status: 'dismissed', created_at: 300, mitigation_count: 10 }),
+      alert({ id: 'disputed', status: 'disputed', created_at: 400, mitigation_count: 0 }),
     ]);
 
     const response = await handleListOpsAlerts(
@@ -108,6 +109,26 @@ describe('ops alert triage', () => {
     expect(JSON.stringify(body)).not.toContain('suspect_review_ids');
     expect(JSON.stringify(body)).not.toContain('agent-under-attack');
     expect(JSON.stringify(body)).not.toContain('venue-a');
+  });
+
+  it('can list disputed alerts for ops follow-up', async () => {
+    const db = new FakeOpsAlertDb([
+      alert({ id: 'disputed', status: 'disputed', created_at: 400, mitigation_count: 0 }),
+    ]);
+
+    const response = await handleListOpsAlerts(
+      new Request('https://api.test/api/v1/ops/alerts?status=disputed', {
+        headers: { Authorization: 'Bearer ops-secret' },
+      }),
+      { DB: db as unknown as D1Database, OPS_ALERTS_TOKEN: 'ops-secret' },
+    );
+    const body = await response.json() as { alerts: Array<{ id: string; status: string }>; count: number };
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      count: 1,
+      alerts: [{ id: 'disputed', status: 'disputed' }],
+    });
   });
 
   it('dismisses an alert, clears active mitigations, and records a triage audit event', async () => {
