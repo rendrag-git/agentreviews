@@ -16,6 +16,7 @@ import { handleRegister, handleGetProfile, handleGetReviews } from './routes/age
 import { handlePostVouch, recomputeTrustScores } from './routes/trust';
 import { recomputeVenueScores } from './routes/scoring';
 import { runDetectors } from './routes/detection';
+import { deliverDiscordAlerts } from './lib/alert-delivery';
 import { handleGetVenue, handleResolveVenue } from './routes/venues';
 import {
   handleGetConsistencyProof,
@@ -53,9 +54,16 @@ export default {
   },
 
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    const epoch = Date.now();
     await purgeExpiredPowChallenges(env);
     await recomputeTrustScores(env);
-    await runDetectors(env);
+    const detectorPlan = await runDetectors(env, epoch);
+    await deliverDiscordAlerts({
+      db: env.DB,
+      webhookUrl: env.DISCORD_ALERT_WEBHOOK,
+      alerts: detectorPlan.alerts,
+      now: epoch,
+    });
     await recomputeVenueScores(env);
     await publishLogRoot(env);
   },

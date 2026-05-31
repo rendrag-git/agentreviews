@@ -12,6 +12,9 @@ migrations_dir = "migrations"
 [triggers]
 crons = ["45 3 * * *"]
 
+# Optional secret for L4 detector alert delivery:
+# wrangler secret put DISCORD_ALERT_WEBHOOK
+
 # R2 for photo storage (v1.1 — enable R2 in CF dashboard first)
 # [[r2_buckets]]
 # binding = "MEDIA"
