@@ -28,8 +28,9 @@ describe('alert delivery', () => {
 
     expect(payload.content).toContain('critical');
     expect(payload.embeds[0].title).toBe('venue.review_bomb');
+    expect(payload.content).not.toContain('venue-1');
     expect(payload.embeds[0].fields).toEqual(expect.arrayContaining([
-      { name: 'Subject', value: 'venue:venue-1', inline: true },
+      { name: 'Subject', value: 'venue:redacted', inline: true },
       { name: 'Auto action', value: 'shadow_downweight', inline: true },
       { name: 'review_count', value: '8', inline: true },
       { name: 'max_conn_fp_count', value: '8', inline: true },
@@ -37,6 +38,28 @@ describe('alert delivery', () => {
     expect(JSON.stringify(payload)).not.toContain('raw-private-fingerprint');
     expect(JSON.stringify(payload)).not.toContain('suspect_review_ids');
     expect(payload.embeds[0].fields.map((field) => field.name)).not.toContain('conn_fp');
+  });
+
+  it('redacts target agent and venue identifiers from Discord alert payloads', () => {
+    const payload = buildDiscordAlertPayload({
+      ...alert,
+      type: 'agent.targeted',
+      subject_type: 'agent',
+      subject_id: 'agent-under-attack',
+      evidence_json: JSON.stringify({
+        target_agent_id: 'agent-under-attack',
+        venue_ids: ['venue-a', 'venue-b'],
+        score: 7,
+      }),
+    });
+
+    expect(payload.content).toBe('[critical] agent.targeted on agent:redacted');
+    expect(JSON.stringify(payload)).not.toContain('agent-under-attack');
+    expect(JSON.stringify(payload)).not.toContain('venue-a');
+    expect(JSON.stringify(payload)).not.toContain('venue-b');
+    expect(payload.embeds[0].fields).toEqual(expect.arrayContaining([
+      { name: 'score', value: '7', inline: true },
+    ]));
   });
 
   it('persists Discord delivery cooldown by alert dedup key', async () => {

@@ -1,4 +1,5 @@
 import type { AlertRow } from './detector-materialization';
+import { parseAlertEvidence, redactAlertEvidence } from './alert-evidence';
 
 export interface DiscordWebhookPayload {
   content: string;
@@ -30,11 +31,6 @@ export interface DeliverDiscordAlertsInput {
   fetcher?: AlertDeliveryFetch;
 }
 
-const PRIVATE_EVIDENCE_KEYS = new Set([
-  'conn_fp',
-  'suspect_review_ids',
-  'suspect_action_ids',
-]);
 const DEFAULT_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 export async function deliverDiscordAlerts(input: DeliverDiscordAlertsInput): Promise<AlertDeliveryResult> {
@@ -89,12 +85,12 @@ export async function deliverDiscordAlerts(input: DeliverDiscordAlertsInput): Pr
 }
 
 export function buildDiscordAlertPayload(alert: AlertRow): DiscordWebhookPayload {
-  const evidence = parseEvidence(alert.evidence_json);
+  const evidence = redactAlertEvidence(parseAlertEvidence(alert.evidence_json));
+  const subject = `${alert.subject_type}:redacted`;
   const fields = [
-    { name: 'Subject', value: `${alert.subject_type}:${alert.subject_id}`, inline: true },
+    { name: 'Subject', value: subject, inline: true },
     { name: 'Auto action', value: alert.auto_action_taken || 'none', inline: true },
     ...Object.entries(evidence)
-      .filter(([key]) => !PRIVATE_EVIDENCE_KEYS.has(key))
       .map(([key, value]) => ({
         name: key,
         value: String(value),
@@ -103,20 +99,11 @@ export function buildDiscordAlertPayload(alert: AlertRow): DiscordWebhookPayload
   ];
 
   return {
-    content: `[${alert.severity}] ${alert.type} on ${alert.subject_type}:${alert.subject_id}`,
+    content: `[${alert.severity}] ${alert.type} on ${subject}`,
     embeds: [{
       title: alert.type,
       color: alert.severity === 'critical' ? 0xff4757 : 0xffb020,
       fields,
     }],
   };
-}
-
-function parseEvidence(evidenceJson: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(evidenceJson);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
 }

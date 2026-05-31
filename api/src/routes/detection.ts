@@ -254,14 +254,30 @@ async function persistDetectorPlan(
     statements.push(env.DB.prepare(
       `INSERT INTO review_mitigations (
          review_id, alert_id, venue_id, multiplier, reason, created_at, cleared_at
-       ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+       )
+       SELECT ?, ?, ?, ?, ?, ?, NULL
+       WHERE EXISTS (
+         SELECT 1 FROM alerts
+         WHERE id = ?
+           AND status = 'open'
+           AND cleared_at IS NULL
+       )
        ON CONFLICT(review_id) DO UPDATE
        SET alert_id = excluded.alert_id,
            venue_id = excluded.venue_id,
            multiplier = excluded.multiplier,
            reason = excluded.reason,
            created_at = excluded.created_at,
-           cleared_at = NULL`,
+           cleared_at = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM alerts
+               WHERE id = excluded.alert_id
+                 AND status = 'open'
+                 AND cleared_at IS NULL
+             )
+             THEN NULL
+             ELSE review_mitigations.cleared_at
+           END`,
     ).bind(
       mitigation.review_id,
       mitigation.alert_id,
@@ -269,6 +285,7 @@ async function persistDetectorPlan(
       mitigation.multiplier,
       mitigation.reason,
       mitigation.created_at,
+      mitigation.alert_id,
     ));
   }
 

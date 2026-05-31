@@ -28,6 +28,7 @@ import {
   publishLogRoot,
 } from './routes/log';
 import { handlePowChallenge, purgeExpiredPowChallenges } from './routes/pow';
+import { handleDismissOpsAlert, handleListOpsAlerts } from './routes/ops-alerts';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -112,6 +113,15 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   // GET /api/v1/reviews/recent — Latest reviews feed
   if (path === '/api/v1/reviews/recent' && method === 'GET') {
     return handleRecentReviews(request, env);
+  }
+
+  if (path === '/api/v1/ops/alerts' && method === 'GET') {
+    return handleListOpsAlerts(request, env);
+  }
+
+  const opsDismissMatch = path.match(/^\/api\/v1\/ops\/alerts\/([^/]+)\/dismiss$/);
+  if (opsDismissMatch && method === 'POST') {
+    return handleDismissOpsAlert(request, env, decodeURIComponent(opsDismissMatch[1]));
   }
 
   if (path === '/api/v1/log/root' && method === 'GET') {

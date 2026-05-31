@@ -5,6 +5,7 @@ export interface Env {
   OPERATOR_PUBLIC_KEY?: string;
   CONN_FP_SECRET?: string;
   DISCORD_ALERT_WEBHOOK?: string;
+  OPS_ALERTS_TOKEN?: string;
 }
 
 export interface AgentAuth {
