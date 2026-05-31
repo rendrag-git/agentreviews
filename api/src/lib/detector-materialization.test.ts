@@ -8,10 +8,10 @@ describe('detector materialization planning', () => {
   it('advances a log cursor and plans deduped alert and shadow mitigations once', () => {
     const entries = [
       ...Array.from({ length: 8 }, (_, index) => ({
-      seq: index + 1,
-      event_type: 'review.create',
-      object_id: `review-${index}`,
-      created_at: now - 60_000,
+        seq: index + 1,
+        event_type: 'review.create',
+        object_id: `review-${index}`,
+        created_at: now - 60_000,
       })),
       {
         seq: 9,
@@ -146,6 +146,76 @@ describe('detector materialization planning', () => {
 
     expect(replay).toMatchObject({
       next_cursor_seq: 16,
+      anomalyScores: [],
+      alerts: [],
+      reviewMitigations: [],
+    });
+  });
+
+  it('plans an agent-targeted alert for signed down-action pressure across multiple venues', () => {
+    const entries = Array.from({ length: 8 }, (_, index) => ({
+      seq: index + 1,
+      event_type: index % 2 === 0 ? 'review.flag' : 'review.vote',
+      object_id: `target-action-${index}`,
+      created_at: now - 60_000,
+    }));
+    const actionRows = Array.from({ length: 8 }, (_, index) => ({
+      id: `target-action-${index}`,
+      review_id: `target-review-${index % 4}`,
+      target_agent_id: 'agent-under-attack',
+      venue_id: `venue-${index % 4}`,
+      agent_id: `fresh-attacker-${index}`,
+      event_type: index % 2 === 0 ? 'review.flag' as const : 'review.vote' as const,
+      vote: index % 2 === 0 ? undefined : -1,
+      created_at: now - 60_000,
+      agent_created_at: now - 60_000,
+      actor_trust: 0.01,
+      signed: true,
+      conn_fp: 'shared-private-fingerprint',
+    }));
+
+    const first = planDetectorMaterialization({
+      detector: 'l4_hot_path',
+      cursor_seq: 0,
+      now,
+      windowMs: HOUR,
+      logEntries: entries,
+      reviews: [],
+      reviewActions: actionRows,
+    });
+
+    expect(first.next_cursor_seq).toBe(8);
+    expect(first.reviewMitigations).toEqual([]);
+    expect(first.alerts).toHaveLength(1);
+    expect(first.alerts[0]).toMatchObject({
+      type: 'agent.targeted',
+      subject_type: 'agent',
+      subject_id: 'agent-under-attack',
+      severity: 'critical',
+      auto_action_taken: 'targeted_agent_watch',
+    });
+    expect(first.alerts[0].dedup_key).toMatch(/^agent\.targeted:agent-under-attack:/);
+    expect(first.anomalyScores[0]).toMatchObject({
+      type: 'agent.targeted',
+      subject_type: 'agent',
+      subject_id: 'agent-under-attack',
+    });
+    expect(first.alerts[0].evidence_json).toContain('target-review-0');
+    expect(first.alerts[0].evidence_json).toContain('venue-0');
+    expect(JSON.stringify(first.alerts)).not.toContain('shared-private-fingerprint');
+
+    const replay = planDetectorMaterialization({
+      detector: 'l4_hot_path',
+      cursor_seq: first.next_cursor_seq,
+      now,
+      windowMs: HOUR,
+      logEntries: entries,
+      reviews: [],
+      reviewActions: actionRows,
+    });
+
+    expect(replay).toMatchObject({
+      next_cursor_seq: 8,
       anomalyScores: [],
       alerts: [],
       reviewMitigations: [],

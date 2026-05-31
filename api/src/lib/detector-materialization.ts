@@ -1,4 +1,5 @@
 import {
+  detectAgentTargeting,
   detectReviewActionSwarms,
   detectVenueReviewCampaigns,
   type ReviewActionEvent,
@@ -104,6 +105,11 @@ export function planDetectorMaterialization(input: DetectorMaterializationInput)
     windowMs: input.windowMs,
     actions: candidateActions,
   });
+  const agentTargetingDetections = detectAgentTargeting({
+    now: input.now,
+    windowMs: input.windowMs,
+    actions: candidateActions,
+  });
 
   const anomalyScores: AnomalyScoreRow[] = [];
   const alerts: AlertRow[] = [];
@@ -184,6 +190,43 @@ export function planDetectorMaterialization(input: DetectorMaterializationInput)
       status: 'open',
       evidence_json: evidenceJson,
       auto_action_taken: detection.type === 'review.flag_swarm' ? 'flag_swarm_gate' : 'vote_swarm_watch',
+      created_at: input.now,
+      last_seen_at: input.now,
+    });
+  }
+
+  for (const detection of agentTargetingDetections) {
+    const evidenceJson = JSON.stringify({
+      ...detection.evidence,
+      suspect_action_ids: detection.suspect_action_ids,
+      suspect_review_ids: detection.suspect_review_ids,
+      venue_ids: detection.venue_ids,
+    });
+    const dedupKey = `${detection.type}:${detection.target_agent_id}:${sixHourBucket(input.now)}`;
+    const alertId = dedupKey;
+    anomalyScores.push({
+      id: ulid(),
+      type: detection.type,
+      subject_type: 'agent',
+      subject_id: detection.target_agent_id,
+      severity: detection.severity,
+      score: detection.score,
+      window_start: detection.window_start,
+      window_end: detection.window_end,
+      evidence_json: evidenceJson,
+      status: 'open',
+      created_at: input.now,
+    });
+    alerts.push({
+      id: alertId,
+      type: detection.type,
+      subject_type: 'agent',
+      subject_id: detection.target_agent_id,
+      severity: detection.severity,
+      dedup_key: dedupKey,
+      status: 'open',
+      evidence_json: evidenceJson,
+      auto_action_taken: 'targeted_agent_watch',
       created_at: input.now,
       last_seen_at: input.now,
     });

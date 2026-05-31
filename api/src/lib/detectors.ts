@@ -1,5 +1,6 @@
 export type DetectionType = 'venue.review_bomb' | 'venue.astroturf';
 export type ReviewActionDetectionType = 'review.flag_swarm' | 'review.vote_swarm';
+export type AgentTargetingDetectionType = 'agent.targeted';
 export type DetectionSeverity = 'warn' | 'critical';
 
 export interface VenueCampaignReview {
@@ -41,6 +42,8 @@ export interface VenueCampaignDetection {
 export interface ReviewActionEvent {
   id: string;
   review_id: string;
+  target_agent_id?: string | null;
+  venue_id?: string | null;
   agent_id: string;
   event_type: 'review.flag' | 'review.vote';
   vote?: number;
@@ -74,6 +77,28 @@ export interface ReviewActionSwarmDetection {
     max_conn_fp_count: number;
     velocity_score: number;
     coordination_score: number;
+  };
+}
+
+export interface AgentTargetingDetection {
+  type: AgentTargetingDetectionType;
+  severity: DetectionSeverity;
+  target_agent_id: string;
+  score: number;
+  window_start: number;
+  window_end: number;
+  suspect_action_ids: string[];
+  suspect_review_ids: string[];
+  venue_ids: string[];
+  evidence: {
+    action_count: number;
+    attacker_count: number;
+    affected_review_count: number;
+    affected_venue_count: number;
+    frac_new: number;
+    frac_low_trust: number;
+    max_conn_fp_count: number;
+    targeting_score: number;
   };
 }
 
@@ -123,6 +148,26 @@ export function detectReviewActionSwarms(input: ReviewActionSwarmInput): ReviewA
       const [reviewId, eventType] = key.split(':') as [string, ReviewActionEvent['event_type']];
       return detectReviewActionGroup(reviewId, eventType, actions, input.now, windowStart, expected);
     });
+}
+
+export function detectAgentTargeting(input: ReviewActionSwarmInput): AgentTargetingDetection[] {
+  const windowMs = input.windowMs ?? DEFAULT_WINDOW_MS;
+  const windowStart = input.now - windowMs;
+  const byTarget = new Map<string, ReviewActionEvent[]>();
+
+  for (const action of input.actions) {
+    if (!action.signed) continue;
+    if (action.created_at < windowStart || action.created_at > input.now) continue;
+    if (action.event_type === 'review.vote' && action.vote !== -1) continue;
+    if (!action.target_agent_id || !action.venue_id) continue;
+    const actions = byTarget.get(action.target_agent_id) ?? [];
+    actions.push(action);
+    byTarget.set(action.target_agent_id, actions);
+  }
+
+  return [...byTarget.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .flatMap(([targetAgentId, actions]) => detectAgentTargetGroup(targetAgentId, actions, input.now, windowStart));
 }
 
 function detectVenue(
@@ -219,6 +264,51 @@ function detectReviewActionGroup(
       max_conn_fp_count: maxConnFpCount,
       velocity_score: round(velocityScore),
       coordination_score: score,
+    },
+  }];
+}
+
+function detectAgentTargetGroup(
+  targetAgentId: string,
+  actions: ReviewActionEvent[],
+  now: number,
+  windowStart: number,
+): AgentTargetingDetection[] {
+  const attackerCount = new Set(actions.map((action) => action.agent_id)).size;
+  const reviewIds = [...new Set(actions.map((action) => action.review_id))].sort();
+  const venueIds = [...new Set(actions.map((action) => action.venue_id).filter((venueId): venueId is string => Boolean(venueId)))].sort();
+  if (attackerCount < 8 || venueIds.length < 3) return [];
+
+  const newCount = actions.filter((action) => now - action.agent_created_at <= NEW_AGENT_AGE_MS).length;
+  const lowTrustCount = actions.filter((action) => finiteTrust(action.actor_trust) < LOW_TRUST_THRESHOLD).length;
+  const connFpCounts = countBy(actions.map((action) => action.conn_fp).filter((connFp): connFp is string => Boolean(connFp)));
+  const maxConnFpCount = Math.max(0, ...connFpCounts.values());
+  const fracNew = newCount / actions.length;
+  const fracLowTrust = lowTrustCount / actions.length;
+  if (fracLowTrust < 0.5) return [];
+
+  const targetingScore = round((attackerCount / 2) * (1 + fracNew + fracLowTrust + venueIds.length / 10));
+  if (targetingScore < 4) return [];
+
+  return [{
+    type: 'agent.targeted',
+    severity: targetingScore >= 6 ? 'critical' : 'warn',
+    target_agent_id: targetAgentId,
+    score: targetingScore,
+    window_start: windowStart,
+    window_end: now,
+    suspect_action_ids: actions.map((action) => action.id).sort(),
+    suspect_review_ids: reviewIds,
+    venue_ids: venueIds,
+    evidence: {
+      action_count: actions.length,
+      attacker_count: attackerCount,
+      affected_review_count: reviewIds.length,
+      affected_venue_count: venueIds.length,
+      frac_new: round(fracNew),
+      frac_low_trust: round(fracLowTrust),
+      max_conn_fp_count: maxConnFpCount,
+      targeting_score: targetingScore,
     },
   }];
 }

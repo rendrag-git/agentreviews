@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectReviewActionSwarms, detectVenueReviewCampaigns } from './detectors';
+import { detectAgentTargeting, detectReviewActionSwarms, detectVenueReviewCampaigns } from './detectors';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -145,6 +145,82 @@ describe('review action swarm detectors', () => {
           event_type: 'review.flag' as const,
           created_at: now - 60_000,
           agent_created_at: now,
+          actor_trust: 0,
+          signed: false,
+          conn_fp: 'shared-private-fingerprint',
+        })),
+      ],
+    });
+
+    expect(detections).toEqual([]);
+  });
+});
+
+describe('agent targeting detectors', () => {
+  it('raises one target-author alert for signed low-trust down-actions across multiple venues', () => {
+    const detections = detectAgentTargeting({
+      now,
+      windowMs: HOUR,
+      actions: Array.from({ length: 8 }, (_, index) => ({
+        id: `target-action-${index}`,
+        review_id: `target-review-${index % 4}`,
+        target_agent_id: 'agent-under-attack',
+        venue_id: `venue-${index % 4}`,
+        agent_id: `fresh-attacker-${index}`,
+        event_type: index % 2 === 0 ? 'review.flag' as const : 'review.vote' as const,
+        vote: index % 2 === 0 ? undefined : -1,
+        created_at: now - 60_000,
+        agent_created_at: now - 60_000,
+        actor_trust: 0.01,
+        signed: true,
+        conn_fp: 'shared-private-fingerprint',
+      })),
+    });
+
+    expect(detections).toHaveLength(1);
+    expect(detections[0]).toMatchObject({
+      type: 'agent.targeted',
+      severity: 'critical',
+      target_agent_id: 'agent-under-attack',
+      evidence: {
+        action_count: 8,
+        attacker_count: 8,
+        affected_review_count: 4,
+        affected_venue_count: 4,
+        max_conn_fp_count: 8,
+      },
+    });
+    expect(detections[0].venue_ids).toEqual(['venue-0', 'venue-1', 'venue-2', 'venue-3']);
+    expect(JSON.stringify(detections)).not.toContain('shared-private-fingerprint');
+  });
+
+  it('ignores organic trusted down-actions and legacy unsigned targeting attempts', () => {
+    const detections = detectAgentTargeting({
+      now,
+      windowMs: HOUR,
+      actions: [
+        ...Array.from({ length: 8 }, (_, index) => ({
+          id: `organic-target-${index}`,
+          review_id: `trusted-review-${index % 4}`,
+          target_agent_id: 'trusted-author',
+          venue_id: `trusted-venue-${index % 4}`,
+          agent_id: `known-${index}`,
+          event_type: 'review.flag' as const,
+          created_at: now - 60_000,
+          agent_created_at: now - 120 * DAY,
+          actor_trust: 0.8,
+          signed: true,
+          conn_fp: `independent-${index}`,
+        })),
+        ...Array.from({ length: 8 }, (_, index) => ({
+          id: `legacy-target-${index}`,
+          review_id: `legacy-review-${index % 4}`,
+          target_agent_id: 'legacy-target',
+          venue_id: `legacy-venue-${index % 4}`,
+          agent_id: `legacy-${index}`,
+          event_type: 'review.flag' as const,
+          created_at: now - 60_000,
+          agent_created_at: now - 60_000,
           actor_trust: 0,
           signed: false,
           conn_fp: 'shared-private-fingerprint',

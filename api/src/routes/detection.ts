@@ -59,20 +59,41 @@ async function loadDetectionReviewActions(
 ): Promise<ReviewActionEvent[]> {
   const actionPlaceholders = actionIds.map(() => '?').join(', ');
   const affectedReviews = await env.DB.prepare(
-    `SELECT review_id FROM flags WHERE action_id IN (${actionPlaceholders})
+    `SELECT f.review_id, r.agent_id AS target_agent_id
+     FROM flags f
+     JOIN reviews r ON r.id = f.review_id
+     WHERE f.action_id IN (${actionPlaceholders})
      UNION
-     SELECT review_id FROM votes WHERE action_id IN (${actionPlaceholders})`,
+     SELECT v.review_id, r.agent_id AS target_agent_id
+     FROM votes v
+     JOIN reviews r ON r.id = v.review_id
+     WHERE v.action_id IN (${actionPlaceholders})`,
   )
     .bind(...actionIds, ...actionIds)
-    .all<{ review_id: string }>();
-  const reviewIds = (affectedReviews.results || []).map((row) => row.review_id);
-  if (reviewIds.length === 0) return [];
+    .all<{ review_id: string; target_agent_id: string }>();
+  const affectedRows = affectedReviews.results || [];
+  const reviewIds = [...new Set(affectedRows.map((row) => row.review_id))];
+  const targetAgentIds = [...new Set(affectedRows.map((row) => row.target_agent_id))];
+  if (reviewIds.length === 0 && targetAgentIds.length === 0) return [];
 
-  const reviewPlaceholders = reviewIds.map(() => '?').join(', ');
+  const scopeClauses: string[] = [];
+  const scopeValues: string[] = [];
+  if (reviewIds.length > 0) {
+    scopeClauses.push(`r.id IN (${reviewIds.map(() => '?').join(', ')})`);
+    scopeValues.push(...reviewIds);
+  }
+  if (targetAgentIds.length > 0) {
+    scopeClauses.push(`r.agent_id IN (${targetAgentIds.map(() => '?').join(', ')})`);
+    scopeValues.push(...targetAgentIds);
+  }
+  const actionScopeSql = scopeClauses.join(' OR ');
+
   const flags = await env.DB.prepare(
     `SELECT
        f.action_id AS id,
        f.review_id,
+       r.agent_id AS target_agent_id,
+       r.venue_id,
        f.agent_id,
        'review.flag' AS event_type,
        f.created_at,
@@ -81,20 +102,23 @@ async function loadDetectionReviewActions(
        f.signed,
        le.conn_fp
      FROM flags f
+     JOIN reviews r ON r.id = f.review_id
      JOIN agents a ON a.id = f.agent_id
      LEFT JOIN log_entries le ON le.seq = f.log_seq
-     WHERE f.review_id IN (${reviewPlaceholders})
+     WHERE (${actionScopeSql})
        AND f.created_at >= ?
        AND f.signed = 1
        AND f.action_id IS NOT NULL`,
   )
-    .bind(...reviewIds, windowStart)
+    .bind(...scopeValues, windowStart)
     .all<ReviewActionEvent>();
 
   const votes = await env.DB.prepare(
     `SELECT
        v.action_id AS id,
        v.review_id,
+       r.agent_id AS target_agent_id,
+       r.venue_id,
        v.agent_id,
        'review.vote' AS event_type,
        v.vote,
@@ -104,14 +128,15 @@ async function loadDetectionReviewActions(
        v.signed,
        le.conn_fp
      FROM votes v
+     JOIN reviews r ON r.id = v.review_id
      JOIN agents a ON a.id = v.agent_id
      LEFT JOIN log_entries le ON le.seq = v.log_seq
-     WHERE v.review_id IN (${reviewPlaceholders})
+     WHERE (${actionScopeSql})
        AND v.created_at >= ?
        AND v.signed = 1
        AND v.action_id IS NOT NULL`,
   )
-    .bind(...reviewIds, windowStart)
+    .bind(...scopeValues, windowStart)
     .all<ReviewActionEvent>();
 
   return [
