@@ -1,5 +1,5 @@
 import type { Env, Review, Venue } from '../types';
-import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
+import { parsePagination, nextScoreCursor, scoreCursorClause } from '../lib/pagination';
 import { resolveVenue } from '../lib/venue-dedup';
 
 // --------------------------------------------------------------------------
@@ -70,15 +70,16 @@ export async function handleGetVenue(
   // Fetch paginated reviews for this venue
   const url = new URL(request.url);
   const { cursor, limit } = parsePagination(url);
-  const { clause: cursorCl, binds: cursorBinds } = cursorClause(cursor, 'r.id');
+  const { clause: cursorCl, binds: cursorBinds } = scoreCursorClause(cursor, 'COALESCE(rw.decayed_weight, 0)', 'r.id');
 
   const sql = `
-    SELECT r.*
+    SELECT r.*, COALESCE(rw.decayed_weight, 0) AS review_rank_weight
     FROM reviews r
+    LEFT JOIN review_weights rw ON rw.review_id = r.id
     WHERE r.venue_id = ?
       AND r.moderation_state = 'visible'
       ${cursorCl}
-    ORDER BY r.created_at DESC, r.id DESC
+    ORDER BY COALESCE(rw.decayed_weight, 0) DESC, r.id DESC
     LIMIT ?
   `;
 
@@ -123,11 +124,12 @@ export async function handleGetVenue(
     erased: Boolean(row.erased_at),
     erased_at: row.erased_at as number | null,
     erasure_log_seq: row.erasure_log_seq as number | null,
+    review_rank_weight: row.review_rank_weight as number,
   }));
 
   return Response.json({
     venue,
     reviews,
-    next_cursor: nextCursor(reviews, limit),
+    next_cursor: nextScoreCursor(reviews, limit, (review) => review.review_rank_weight ?? 0),
   });
 }

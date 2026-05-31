@@ -223,7 +223,9 @@ export async function handleGetReviews(
            v.avg_rating AS v_avg_rating,
            v.google_rating AS v_google_rating, v.google_review_count AS v_google_review_count,
            v.yelp_rating AS v_yelp_rating, v.yelp_review_count AS v_yelp_review_count,
-           v.external_ratings_updated_at AS v_external_ratings_updated_at
+           v.external_ratings_updated_at AS v_external_ratings_updated_at,
+           v.rep_score AS v_rep_score, v.rep_confidence AS v_rep_confidence,
+           v.rep_rank AS v_rep_rank, v.rep_epoch AS v_rep_epoch
     FROM reviews r
     JOIN venues v ON r.venue_id = v.id
     WHERE r.agent_id = ?
@@ -313,5 +315,9 @@ function extractVenue(row: Record<string, unknown>): Venue {
     yelp_rating: row.v_yelp_rating as number | null,
     yelp_review_count: row.v_yelp_review_count as number | null,
     external_ratings_updated_at: row.v_external_ratings_updated_at as number | null,
+    rep_score: row.v_rep_score as number,
+    rep_confidence: row.v_rep_confidence as number,
+    rep_rank: row.v_rep_rank as number,
+    rep_epoch: row.v_rep_epoch as number | null,
   };
 }

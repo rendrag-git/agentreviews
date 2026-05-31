@@ -44,6 +44,10 @@ export interface Venue {
   yelp_rating: number | null;
   yelp_review_count: number | null;
   external_ratings_updated_at: number | null;
+  rep_score: number;
+  rep_confidence: number;
+  rep_rank: number;
+  rep_epoch: number | null;
 }
 
 export interface Review {
@@ -84,6 +88,7 @@ export interface Review {
   erased_at: number | null;
   erasure_log_seq: number | null;
   agent_username?: string;
+  review_rank_weight?: number;
 }
 
 export interface Agent {

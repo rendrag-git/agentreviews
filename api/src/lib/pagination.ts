@@ -42,3 +42,36 @@ export function nextCursor<T extends { id: string }>(
   if (results.length < limit) return null;
   return results[results.length - 1].id;
 }
+
+export function scoreCursorClause(
+  cursor: string | undefined,
+  scoreColumn: string,
+  idColumn: string,
+): { clause: string; binds: unknown[] } {
+  if (!cursor) return { clause: '', binds: [] };
+  const parsed = parseScoreCursor(cursor);
+  if (!parsed) return cursorClause(cursor, idColumn);
+  return {
+    clause: `AND (${scoreColumn} < ? OR (${scoreColumn} = ? AND ${idColumn} < ?))`,
+    binds: [parsed.score, parsed.score, parsed.id],
+  };
+}
+
+export function nextScoreCursor<T extends { id: string }>(
+  results: T[],
+  limit: number,
+  scoreOf: (result: T) => number,
+): string | null {
+  if (results.length < limit) return null;
+  const last = results[results.length - 1];
+  return `${scoreOf(last)}:${last.id}`;
+}
+
+function parseScoreCursor(cursor: string): { score: number; id: string } | null {
+  const separator = cursor.indexOf(':');
+  if (separator <= 0) return null;
+  const score = Number(cursor.slice(0, separator));
+  const id = cursor.slice(separator + 1);
+  if (!Number.isFinite(score) || !id) return null;
+  return { score, id };
+}

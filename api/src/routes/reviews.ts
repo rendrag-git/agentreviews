@@ -3,7 +3,7 @@ import { VALID_CATEGORIES as CATEGORIES } from '../types';
 import { ulid } from '../lib/ulid';
 import { resolveVenue } from '../lib/venue-dedup';
 import { encode, neighbors, precisionForRadius, haversineMeters } from '../lib/geohash';
-import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
+import { parsePagination, cursorClause, nextCursor, nextScoreCursor, scoreCursorClause } from '../lib/pagination';
 import {
   hasSignedReviewFields,
   validateSignedReview,
@@ -273,7 +273,7 @@ export async function handleNearbyReviews(
   }
 
   // Cursor
-  const { clause: cursorCl, binds: cursorBinds } = cursorClause(cursor, 'r.id');
+  const { clause: cursorCl, binds: cursorBinds } = scoreCursorClause(cursor, 'v.rep_rank', 'r.id');
 
   // Exclude reviews soft-hidden by trust-weighted moderation.
   const sql = `
@@ -284,14 +284,16 @@ export async function handleNearbyReviews(
            v.avg_rating AS v_avg_rating,
            v.google_rating AS v_google_rating, v.google_review_count AS v_google_review_count,
            v.yelp_rating AS v_yelp_rating, v.yelp_review_count AS v_yelp_review_count,
-           v.external_ratings_updated_at AS v_external_ratings_updated_at
+           v.external_ratings_updated_at AS v_external_ratings_updated_at,
+           v.rep_score AS v_rep_score, v.rep_confidence AS v_rep_confidence,
+           v.rep_rank AS v_rep_rank, v.rep_epoch AS v_rep_epoch
     FROM reviews r
     JOIN venues v ON r.venue_id = v.id
     WHERE (${geoConditions})
       ${categoryClause}
       AND r.moderation_state = 'visible'
       ${cursorCl}
-    ORDER BY r.id DESC
+    ORDER BY v.rep_rank DESC, r.id DESC
     LIMIT ?
   `;
 
@@ -307,7 +309,7 @@ export async function handleNearbyReviews(
     reviews,
     count: reviews.length,
     center: { lat, lng },
-    next_cursor: nextCursor(reviews, limit),
+    next_cursor: nextScoreCursor(reviews, limit, (review) => review.venue.rep_rank),
   });
 }
 
@@ -336,7 +338,7 @@ export async function handleSearchReviews(
     categoryBinds.push(category);
   }
 
-  const { clause: cursorCl, binds: cursorBinds } = cursorClause(cursor, 'r.id');
+  const { clause: cursorCl, binds: cursorBinds } = scoreCursorClause(cursor, 'v.rep_rank', 'r.id');
 
   // MVP: LIKE search. FTS5 upgrade path noted.
   const sql = `
@@ -347,14 +349,16 @@ export async function handleSearchReviews(
            v.avg_rating AS v_avg_rating,
            v.google_rating AS v_google_rating, v.google_review_count AS v_google_review_count,
            v.yelp_rating AS v_yelp_rating, v.yelp_review_count AS v_yelp_review_count,
-           v.external_ratings_updated_at AS v_external_ratings_updated_at
+           v.external_ratings_updated_at AS v_external_ratings_updated_at,
+           v.rep_score AS v_rep_score, v.rep_confidence AS v_rep_confidence,
+           v.rep_rank AS v_rep_rank, v.rep_epoch AS v_rep_epoch
     FROM reviews r
     JOIN venues v ON r.venue_id = v.id
     WHERE v.name LIKE ?
       ${categoryClause}
       AND r.moderation_state = 'visible'
       ${cursorCl}
-    ORDER BY r.id DESC
+    ORDER BY v.rep_rank DESC, r.id DESC
     LIMIT ?
   `;
 
@@ -370,7 +374,7 @@ export async function handleSearchReviews(
   return Response.json({
     reviews,
     count: reviews.length,
-    next_cursor: nextCursor(reviews, limit),
+    next_cursor: nextScoreCursor(reviews, limit, (review) => review.venue.rep_rank),
   });
 }
 
@@ -582,7 +586,9 @@ export async function handleAgentReviews(
            v.avg_rating AS v_avg_rating,
            v.google_rating AS v_google_rating, v.google_review_count AS v_google_review_count,
            v.yelp_rating AS v_yelp_rating, v.yelp_review_count AS v_yelp_review_count,
-           v.external_ratings_updated_at AS v_external_ratings_updated_at
+           v.external_ratings_updated_at AS v_external_ratings_updated_at,
+           v.rep_score AS v_rep_score, v.rep_confidence AS v_rep_confidence,
+           v.rep_rank AS v_rep_rank, v.rep_epoch AS v_rep_epoch
     FROM reviews r
     JOIN venues v ON r.venue_id = v.id
     WHERE r.agent_pseudonym = ?
@@ -637,7 +643,9 @@ export async function handleRecentReviews(
            v.avg_rating AS v_avg_rating,
            v.google_rating AS v_google_rating, v.google_review_count AS v_google_review_count,
            v.yelp_rating AS v_yelp_rating, v.yelp_review_count AS v_yelp_review_count,
-           v.external_ratings_updated_at AS v_external_ratings_updated_at
+           v.external_ratings_updated_at AS v_external_ratings_updated_at,
+           v.rep_score AS v_rep_score, v.rep_confidence AS v_rep_confidence,
+           v.rep_rank AS v_rep_rank, v.rep_epoch AS v_rep_epoch
     FROM reviews r
     JOIN venues v ON r.venue_id = v.id
     WHERE r.moderation_state = 'visible'
@@ -1008,5 +1016,9 @@ function extractVenue(row: Record<string, unknown>): Venue {
     yelp_rating: row.v_yelp_rating as number | null,
     yelp_review_count: row.v_yelp_review_count as number | null,
     external_ratings_updated_at: row.v_external_ratings_updated_at as number | null,
+    rep_score: row.v_rep_score as number,
+    rep_confidence: row.v_rep_confidence as number,
+    rep_rank: row.v_rep_rank as number,
+    rep_epoch: row.v_rep_epoch as number | null,
   };
 }
