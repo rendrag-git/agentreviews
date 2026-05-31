@@ -16,4 +16,11 @@ describe('trust-weighted flag moderation', () => {
       moderation_state: 'soft_hidden',
     });
   });
+
+  it('suppresses soft-hide when the flag swarm detector has fired', () => {
+    expect(projectFlagModeration([0.8, 0.7], undefined, { flagSwarmActive: true })).toEqual({
+      flag_pressure: 1.5,
+      moderation_state: 'visible',
+    });
+  });
 });

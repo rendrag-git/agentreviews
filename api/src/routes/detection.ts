@@ -4,7 +4,7 @@ import {
   type DetectorLogEntry,
   type DetectorMaterializationPlan,
 } from '../lib/detector-materialization';
-import type { VenueCampaignReview } from '../lib/detectors';
+import type { ReviewActionEvent, VenueCampaignReview } from '../lib/detectors';
 
 const HOT_PATH_DETECTOR = 'l4_hot_path';
 const DETECTION_BATCH_LIMIT = 1000;
@@ -28,8 +28,14 @@ export async function runDetectors(env: Env, epoch = Date.now()): Promise<Detect
   const reviewIds = entries
     .filter((entry) => entry.event_type === 'review.create')
     .map((entry) => entry.object_id);
+  const actionIds = entries
+    .filter((entry) => entry.event_type === 'review.flag' || entry.event_type === 'review.vote')
+    .map((entry) => entry.object_id);
   const reviews = reviewIds.length > 0
     ? await loadDetectionReviews(env, reviewIds, epoch - DETECTION_WINDOW_MS)
+    : [];
+  const reviewActions = actionIds.length > 0
+    ? await loadDetectionReviewActions(env, actionIds, epoch - DETECTION_WINDOW_MS)
     : [];
 
   const plan = planDetectorMaterialization({
@@ -39,10 +45,82 @@ export async function runDetectors(env: Env, epoch = Date.now()): Promise<Detect
     windowMs: DETECTION_WINDOW_MS,
     logEntries: entries,
     reviews,
+    reviewActions,
   });
 
   await persistDetectorPlan(env, plan, epoch);
   return plan;
+}
+
+async function loadDetectionReviewActions(
+  env: Env,
+  actionIds: string[],
+  windowStart: number,
+): Promise<ReviewActionEvent[]> {
+  const actionPlaceholders = actionIds.map(() => '?').join(', ');
+  const affectedReviews = await env.DB.prepare(
+    `SELECT review_id FROM flags WHERE action_id IN (${actionPlaceholders})
+     UNION
+     SELECT review_id FROM votes WHERE action_id IN (${actionPlaceholders})`,
+  )
+    .bind(...actionIds, ...actionIds)
+    .all<{ review_id: string }>();
+  const reviewIds = (affectedReviews.results || []).map((row) => row.review_id);
+  if (reviewIds.length === 0) return [];
+
+  const reviewPlaceholders = reviewIds.map(() => '?').join(', ');
+  const flags = await env.DB.prepare(
+    `SELECT
+       f.action_id AS id,
+       f.review_id,
+       f.agent_id,
+       'review.flag' AS event_type,
+       f.created_at,
+       a.created_at AS agent_created_at,
+       a.trust_score AS actor_trust,
+       f.signed,
+       le.conn_fp
+     FROM flags f
+     JOIN agents a ON a.id = f.agent_id
+     LEFT JOIN log_entries le ON le.seq = f.log_seq
+     WHERE f.review_id IN (${reviewPlaceholders})
+       AND f.created_at >= ?
+       AND f.signed = 1
+       AND f.action_id IS NOT NULL`,
+  )
+    .bind(...reviewIds, windowStart)
+    .all<ReviewActionEvent>();
+
+  const votes = await env.DB.prepare(
+    `SELECT
+       v.action_id AS id,
+       v.review_id,
+       v.agent_id,
+       'review.vote' AS event_type,
+       v.vote,
+       v.created_at,
+       a.created_at AS agent_created_at,
+       a.trust_score AS actor_trust,
+       v.signed,
+       le.conn_fp
+     FROM votes v
+     JOIN agents a ON a.id = v.agent_id
+     LEFT JOIN log_entries le ON le.seq = v.log_seq
+     WHERE v.review_id IN (${reviewPlaceholders})
+       AND v.created_at >= ?
+       AND v.signed = 1
+       AND v.action_id IS NOT NULL`,
+  )
+    .bind(...reviewIds, windowStart)
+    .all<ReviewActionEvent>();
+
+  return [
+    ...(flags.results || []),
+    ...(votes.results || []),
+  ].map((action) => ({
+    ...action,
+    signed: Boolean(action.signed),
+  }));
 }
 
 async function loadDetectionReviews(

@@ -1,4 +1,5 @@
 export type DetectionType = 'venue.review_bomb' | 'venue.astroturf';
+export type ReviewActionDetectionType = 'review.flag_swarm' | 'review.vote_swarm';
 export type DetectionSeverity = 'warn' | 'critical';
 
 export interface VenueCampaignReview {
@@ -37,8 +38,48 @@ export interface VenueCampaignDetection {
   };
 }
 
+export interface ReviewActionEvent {
+  id: string;
+  review_id: string;
+  agent_id: string;
+  event_type: 'review.flag' | 'review.vote';
+  vote?: number;
+  created_at: number;
+  agent_created_at: number;
+  actor_trust: number | null;
+  signed: boolean;
+  conn_fp?: string | null;
+}
+
+export interface ReviewActionSwarmInput {
+  now: number;
+  actions: ReviewActionEvent[];
+  windowMs?: number;
+  expectedActionsPerWindow?: number;
+}
+
+export interface ReviewActionSwarmDetection {
+  type: ReviewActionDetectionType;
+  severity: DetectionSeverity;
+  review_id: string;
+  score: number;
+  window_start: number;
+  window_end: number;
+  suspect_action_ids: string[];
+  evidence: {
+    action_count: number;
+    frac_new: number;
+    frac_low_trust: number;
+    distinct_conn_fp_count: number;
+    max_conn_fp_count: number;
+    velocity_score: number;
+    coordination_score: number;
+  };
+}
+
 const DEFAULT_WINDOW_MS = 60 * 60 * 1000;
 const DEFAULT_EXPECTED_REVIEWS = 1;
+const DEFAULT_EXPECTED_ACTIONS = 1;
 const NEW_AGENT_AGE_MS = 24 * 60 * 60 * 1000;
 const LOW_TRUST_THRESHOLD = 0.1;
 
@@ -58,6 +99,30 @@ export function detectVenueReviewCampaigns(input: VenueCampaignInput): VenueCamp
   return [...byVenue.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .flatMap(([venueId, reviews]) => detectVenue(venueId, reviews, input.now, windowStart, expected));
+}
+
+export function detectReviewActionSwarms(input: ReviewActionSwarmInput): ReviewActionSwarmDetection[] {
+  const windowMs = input.windowMs ?? DEFAULT_WINDOW_MS;
+  const expected = Math.max(0.1, input.expectedActionsPerWindow ?? DEFAULT_EXPECTED_ACTIONS);
+  const windowStart = input.now - windowMs;
+  const byReviewAndType = new Map<string, ReviewActionEvent[]>();
+
+  for (const action of input.actions) {
+    if (!action.signed) continue;
+    if (action.created_at < windowStart || action.created_at > input.now) continue;
+    if (action.event_type === 'review.vote' && action.vote !== -1) continue;
+    const key = `${action.review_id}:${action.event_type}`;
+    const actions = byReviewAndType.get(key) ?? [];
+    actions.push(action);
+    byReviewAndType.set(key, actions);
+  }
+
+  return [...byReviewAndType.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .flatMap(([key, actions]) => {
+      const [reviewId, eventType] = key.split(':') as [string, ReviewActionEvent['event_type']];
+      return detectReviewActionGroup(reviewId, eventType, actions, input.now, windowStart, expected);
+    });
 }
 
 function detectVenue(
@@ -108,6 +173,62 @@ function detectVenue(
       convergence_score: score,
     },
   }];
+}
+
+function detectReviewActionGroup(
+  reviewId: string,
+  eventType: ReviewActionEvent['event_type'],
+  actions: ReviewActionEvent[],
+  now: number,
+  windowStart: number,
+  expected: number,
+): ReviewActionSwarmDetection[] {
+  const count = actions.length;
+  if (count < 5) return [];
+
+  const velocityScore = (count - expected) / Math.sqrt(expected + 1);
+  if (velocityScore < 4) return [];
+
+  const newCount = actions.filter((action) => now - action.agent_created_at <= NEW_AGENT_AGE_MS).length;
+  const lowTrustCount = actions.filter((action) => finiteTrust(action.actor_trust) < LOW_TRUST_THRESHOLD).length;
+  const connFpCounts = countBy(actions.map((action) => action.conn_fp).filter((connFp): connFp is string => Boolean(connFp)));
+  const maxConnFpCount = Math.max(0, ...connFpCounts.values());
+  const distinctConnFpCount = connFpCounts.size;
+  const fracNew = newCount / count;
+  const fracLowTrust = lowTrustCount / count;
+  const fracSharedConnFp = maxConnFpCount / count;
+  const coordinationScore = velocityScore * (1 + fracNew + fracLowTrust + fracSharedConnFp);
+
+  if (coordinationScore < 4) return [];
+  if (fracLowTrust < 0.5 && fracNew < 0.5 && fracSharedConnFp < 0.5) return [];
+
+  const score = round(coordinationScore);
+  return [{
+    type: eventType === 'review.flag' ? 'review.flag_swarm' : 'review.vote_swarm',
+    severity: score >= 6 && count >= 8 ? 'critical' : 'warn',
+    review_id: reviewId,
+    score,
+    window_start: windowStart,
+    window_end: now,
+    suspect_action_ids: actions.map((action) => action.id).sort(),
+    evidence: {
+      action_count: count,
+      frac_new: round(fracNew),
+      frac_low_trust: round(fracLowTrust),
+      distinct_conn_fp_count: distinctConnFpCount,
+      max_conn_fp_count: maxConnFpCount,
+      velocity_score: round(velocityScore),
+      coordination_score: score,
+    },
+  }];
+}
+
+function countBy(values: string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+  return counts;
 }
 
 function finiteTrust(value: number | null): number {

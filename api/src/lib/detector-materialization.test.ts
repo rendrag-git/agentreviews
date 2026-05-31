@@ -67,4 +67,88 @@ describe('detector materialization planning', () => {
       reviewMitigations: [],
     });
   });
+
+  it('plans review-scoped vote and flag swarm alerts from signed action log entries once', () => {
+    const entries = [
+      ...Array.from({ length: 8 }, (_, index) => ({
+        seq: index + 1,
+        event_type: 'review.flag',
+        object_id: `flag-${index}`,
+        created_at: now - 60_000,
+      })),
+      ...Array.from({ length: 8 }, (_, index) => ({
+        seq: index + 9,
+        event_type: 'review.vote',
+        object_id: `vote-${index}`,
+        created_at: now - 30_000,
+      })),
+    ];
+    const actionRows = [
+      ...Array.from({ length: 8 }, (_, index) => ({
+        id: `flag-${index}`,
+        review_id: 'review-target',
+        agent_id: `fresh-flag-${index}`,
+        event_type: 'review.flag' as const,
+        created_at: now - 60_000,
+        agent_created_at: now - 60_000,
+        actor_trust: 0.01,
+        signed: true,
+        conn_fp: 'shared-private-fingerprint',
+      })),
+      ...Array.from({ length: 8 }, (_, index) => ({
+        id: `vote-${index}`,
+        review_id: 'review-target',
+        agent_id: `fresh-vote-${index}`,
+        event_type: 'review.vote' as const,
+        vote: -1,
+        created_at: now - 30_000,
+        agent_created_at: now - 60_000,
+        actor_trust: 0.01,
+        signed: true,
+        conn_fp: 'shared-private-fingerprint',
+      })),
+    ];
+
+    const first = planDetectorMaterialization({
+      detector: 'l4_hot_path',
+      cursor_seq: 0,
+      now,
+      windowMs: HOUR,
+      logEntries: entries,
+      reviews: [],
+      reviewActions: actionRows,
+    });
+
+    expect(first.next_cursor_seq).toBe(16);
+    expect(first.reviewMitigations).toEqual([]);
+    expect(first.alerts.map((alert) => alert.type).sort()).toEqual([
+      'review.flag_swarm',
+      'review.vote_swarm',
+    ]);
+    expect(first.alerts[0]).toMatchObject({
+      subject_type: 'review',
+      subject_id: 'review-target',
+      severity: 'critical',
+      auto_action_taken: 'flag_swarm_gate',
+    });
+    expect(first.alerts[0].dedup_key).toMatch(/^review\.(flag|vote)_swarm:review-target:/);
+    expect(JSON.stringify(first.alerts)).not.toContain('shared-private-fingerprint');
+
+    const replay = planDetectorMaterialization({
+      detector: 'l4_hot_path',
+      cursor_seq: first.next_cursor_seq,
+      now,
+      windowMs: HOUR,
+      logEntries: entries,
+      reviews: [],
+      reviewActions: actionRows,
+    });
+
+    expect(replay).toMatchObject({
+      next_cursor_seq: 16,
+      anomalyScores: [],
+      alerts: [],
+      reviewMitigations: [],
+    });
+  });
 });

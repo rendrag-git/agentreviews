@@ -1,4 +1,9 @@
-import { detectVenueReviewCampaigns, type VenueCampaignReview } from './detectors';
+import {
+  detectReviewActionSwarms,
+  detectVenueReviewCampaigns,
+  type ReviewActionEvent,
+  type VenueCampaignReview,
+} from './detectors';
 import { ulid } from './ulid';
 
 export interface DetectorLogEntry {
@@ -14,6 +19,7 @@ export interface DetectorMaterializationInput {
   now: number;
   logEntries: DetectorLogEntry[];
   reviews: VenueCampaignReview[];
+  reviewActions?: ReviewActionEvent[];
   windowMs?: number;
 }
 
@@ -71,6 +77,7 @@ export function planDetectorMaterialization(input: DetectorMaterializationInput)
     return emptyPlan(input.detector, nextCursor);
   }
   const entries = newEntries.filter((entry) => entry.event_type === 'review.create');
+  const actionEntries = newEntries.filter((entry) => entry.event_type === 'review.flag' || entry.event_type === 'review.vote');
 
   const newReviewIds = new Set(entries.map((entry) => entry.object_id));
   const affectedVenueIds = new Set(
@@ -83,6 +90,19 @@ export function planDetectorMaterialization(input: DetectorMaterializationInput)
     now: input.now,
     windowMs: input.windowMs,
     reviews: candidateReviews,
+  });
+  const newActionIds = new Set(actionEntries.map((entry) => entry.object_id));
+  const affectedReviewIds = new Set(
+    (input.reviewActions ?? [])
+      .filter((action) => newActionIds.has(action.id))
+      .map((action) => action.review_id),
+  );
+  const candidateActions = (input.reviewActions ?? [])
+    .filter((action) => affectedReviewIds.has(action.review_id));
+  const actionDetections = detectReviewActionSwarms({
+    now: input.now,
+    windowMs: input.windowMs,
+    actions: candidateActions,
   });
 
   const anomalyScores: AnomalyScoreRow[] = [];
@@ -132,6 +152,41 @@ export function planDetectorMaterialization(input: DetectorMaterializationInput)
         created_at: input.now,
       });
     }
+  }
+
+  for (const detection of actionDetections) {
+    const evidenceJson = JSON.stringify({
+      ...detection.evidence,
+      suspect_action_ids: detection.suspect_action_ids,
+    });
+    const dedupKey = `${detection.type}:${detection.review_id}:${sixHourBucket(input.now)}`;
+    const alertId = dedupKey;
+    anomalyScores.push({
+      id: ulid(),
+      type: detection.type,
+      subject_type: 'review',
+      subject_id: detection.review_id,
+      severity: detection.severity,
+      score: detection.score,
+      window_start: detection.window_start,
+      window_end: detection.window_end,
+      evidence_json: evidenceJson,
+      status: 'open',
+      created_at: input.now,
+    });
+    alerts.push({
+      id: alertId,
+      type: detection.type,
+      subject_type: 'review',
+      subject_id: detection.review_id,
+      severity: detection.severity,
+      dedup_key: dedupKey,
+      status: 'open',
+      evidence_json: evidenceJson,
+      auto_action_taken: detection.type === 'review.flag_swarm' ? 'flag_swarm_gate' : 'vote_swarm_watch',
+      created_at: input.now,
+      last_seen_at: input.now,
+    });
   }
 
   return {

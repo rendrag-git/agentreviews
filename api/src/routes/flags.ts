@@ -87,7 +87,12 @@ export async function handleFlag(
   )
     .bind(reviewId)
     .all<{ weight: number }>();
-  const projection = projectFlagModeration((weights.results || []).map((row) => row.weight));
+  const flagSwarmActive = await hasActiveFlagSwarmAlert(env, reviewId);
+  const projection = projectFlagModeration(
+    (weights.results || []).map((row) => row.weight),
+    undefined,
+    { flagSwarmActive },
+  );
 
   const newFlagCount = review.flag_count + 1;
   await env.DB.prepare(
@@ -108,7 +113,26 @@ export async function handleFlag(
     moderation_state: projection.moderation_state,
     hidden: projection.moderation_state !== 'visible',
     ...(projection.moderation_state !== 'visible' ? { note: 'Review is now soft-hidden by trust-weighted flag pressure' } : {}),
+    ...(flagSwarmActive && projection.moderation_state === 'visible' ? { note: 'Flag pressure is under detector review before soft-hide' } : {}),
   });
+}
+
+async function hasActiveFlagSwarmAlert(env: Env, reviewId: string): Promise<boolean> {
+  const alert = await env.DB.prepare(
+    `SELECT id
+     FROM alerts
+     WHERE type = ?
+       AND subject_type = ?
+       AND subject_id = ?
+       AND status = ?
+       AND severity = ?
+       AND cleared_at IS NULL
+     LIMIT 1`,
+  )
+    .bind('review.flag_swarm', 'review', reviewId, 'open', 'critical')
+    .first<{ id: string }>();
+
+  return Boolean(alert);
 }
 
 async function insertSignedFlagWithLog(
