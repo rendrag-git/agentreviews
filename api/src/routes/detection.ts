@@ -1,10 +1,12 @@
 import type { Env } from '../types';
+import { buildMitigationApplyLogEntries } from '../lib/mitigation-log';
 import {
   planDetectorMaterialization,
   type DetectorLogEntry,
   type DetectorMaterializationPlan,
 } from '../lib/detector-materialization';
 import type { ReviewActionEvent, VenueCampaignReview } from '../lib/detectors';
+import { GENESIS_PREV_HASH, type LogEntry } from '../lib/transparency-log';
 
 const HOT_PATH_DETECTOR = 'l4_hot_path';
 const DETECTION_BATCH_LIMIT = 1000;
@@ -188,7 +190,7 @@ async function loadDetectionReviews(
   return reviews.results || [];
 }
 
-async function persistDetectorPlan(
+export async function persistDetectorPlan(
   env: Env,
   plan: DetectorMaterializationPlan,
   epoch: number,
@@ -250,6 +252,27 @@ async function persistDetectorPlan(
     ));
   }
 
+  if (plan.reviewMitigations.length > 0) {
+    const tail = await env.DB.prepare('SELECT seq, leaf_hash FROM log_entries ORDER BY seq DESC LIMIT 1')
+      .first<Pick<LogEntry, 'seq' | 'leaf_hash'>>();
+    const applyEntries = await buildMitigationApplyLogEntries({
+      env,
+      mitigations: plan.reviewMitigations.map((mitigation) => ({
+        review_id: mitigation.review_id,
+        alert_id: mitigation.alert_id,
+        reason: mitigation.reason,
+        multiplier: mitigation.multiplier,
+      })),
+      now: epoch,
+      startSeq: tail ? tail.seq + 1 : 1,
+      prevHash: tail ? tail.leaf_hash : GENESIS_PREV_HASH,
+    });
+
+    for (const entry of applyEntries) {
+      statements.push(insertLogEntryStatement(env, entry));
+    }
+  }
+
   for (const mitigation of plan.reviewMitigations) {
     statements.push(env.DB.prepare(
       `INSERT INTO review_mitigations (
@@ -290,4 +313,32 @@ async function persistDetectorPlan(
   }
 
   await env.DB.batch(statements);
+}
+
+function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO log_entries (
+      seq, event_id, event_type, object_type, object_id,
+      agent_pub, sig, sig_nonce, content_hash, canon_payload, sig_alg,
+      prev_hash, leaf_hash, created_at, conn_fp, leaf_version
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      entry.seq,
+      entry.event_id,
+      entry.event_type,
+      entry.object_type,
+      entry.object_id,
+      entry.agent_pub,
+      entry.sig,
+      entry.sig_nonce,
+      entry.content_hash,
+      entry.canon_payload,
+      entry.sig_alg,
+      entry.prev_hash,
+      entry.leaf_hash,
+      entry.created_at,
+      null,
+      entry.leaf_version ?? 1,
+    );
 }

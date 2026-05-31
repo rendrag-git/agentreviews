@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { generateSigningKeyPair } from '../lib/signing';
 import { handleDismissOpsAlert, handleListOpsAlerts } from './ops-alerts';
 import type { Env } from '../types';
 
@@ -131,7 +132,8 @@ describe('ops alert triage', () => {
     });
   });
 
-  it('dismisses an alert, clears active mitigations, and records a triage audit event', async () => {
+  it('dismisses an alert, clears active mitigations, and records signed clear events', async () => {
+    const operatorKey = await generateSigningKeyPair();
     const db = new FakeOpsAlertDb([
       alert({ id: 'alert-1', status: 'open', cleared_at: null }),
     ], [
@@ -145,7 +147,12 @@ describe('ops alert triage', () => {
         headers: { Authorization: 'Bearer ops-secret', 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'false positive' }),
       }),
-      { DB: db as unknown as D1Database, OPS_ALERTS_TOKEN: 'ops-secret' },
+      {
+        DB: db as unknown as D1Database,
+        OPS_ALERTS_TOKEN: 'ops-secret',
+        OPERATOR_PRIVATE_KEY: operatorKey.privateKey,
+        OPERATOR_PUBLIC_KEY: operatorKey.publicKey,
+      },
       'alert-1',
       1_780_000_000_000,
     );
@@ -169,6 +176,22 @@ describe('ops alert triage', () => {
         created_at: 1_780_000_000_000,
       }),
     ]);
+    expect(db.logEntries).toEqual([
+      expect.objectContaining({
+        seq: 1,
+        event_type: 'mitigation.clear',
+        object_type: 'mitigation',
+        object_id: 'review-active:alert-1',
+        agent_pub: operatorKey.publicKey,
+      }),
+    ]);
+    expect(JSON.parse(String(db.logEntries[0].canon_payload))).toEqual({
+      alert_id: 'alert-1',
+      event_type: 'mitigation.clear',
+      reason: 'false positive',
+      review_id: 'review-active',
+      sig_nonce: 'mitigation-clear:review-active:alert-1:1780000000000',
+    });
   });
 
   it('keeps already-dismissed alerts idempotent without rewriting audit state', async () => {
@@ -201,6 +224,7 @@ class FakeOpsAlertDb {
   readonly alerts = new Map<string, AlertRow>();
   readonly mitigations: Array<{ review_id: string; alert_id: string; cleared_at: number | null }>;
   readonly triageEvents: TriageRow[] = [];
+  readonly logEntries: Array<Record<string, unknown>> = [];
   readonly queries: string[] = [];
 
   constructor(
@@ -215,6 +239,12 @@ class FakeOpsAlertDb {
 
   prepare(sql: string) {
     return {
+      first: async () => {
+        if (sql.includes('SELECT seq, leaf_hash FROM log_entries')) {
+          return null;
+        }
+        throw new Error(`Unexpected SQL without bind: ${sql}`);
+      },
       bind: (...values: unknown[]) => {
         this.queries.push(sql);
         if (sql.includes('FROM alerts a')) {
@@ -240,11 +270,18 @@ class FakeOpsAlertDb {
             },
           };
         }
-        if (sql.includes('SELECT COUNT(*) AS count FROM review_mitigations')) {
+        if (sql.includes('SELECT review_id, alert_id FROM review_mitigations')) {
           return {
-            first: async () => ({
-              count: this.mitigations.filter((row) => row.alert_id === values[0] && row.cleared_at === null).length,
+            all: async () => ({
+              results: this.mitigations
+                .filter((row) => row.alert_id === values[0] && row.cleared_at === null)
+                .map((row) => ({ review_id: row.review_id, alert_id: row.alert_id })),
             }),
+          };
+        }
+        if (sql.includes('SELECT seq, leaf_hash FROM log_entries')) {
+          return {
+            first: async () => null,
           };
         }
         if (sql.includes('UPDATE alerts SET status =')) {
@@ -279,6 +316,30 @@ class FakeOpsAlertDb {
                 reason: values[3] === null ? null : String(values[3]),
                 actor: String(values[4]),
                 created_at: Number(values[5]),
+              });
+            },
+          };
+        }
+        if (sql.includes('INSERT INTO log_entries')) {
+          return {
+            run: async () => {
+              this.logEntries.push({
+                seq: values[0],
+                event_id: values[1],
+                event_type: values[2],
+                object_type: values[3],
+                object_id: values[4],
+                agent_pub: values[5],
+                sig: values[6],
+                sig_nonce: values[7],
+                content_hash: values[8],
+                canon_payload: values[9],
+                sig_alg: values[10],
+                prev_hash: values[11],
+                leaf_hash: values[12],
+                created_at: values[13],
+                conn_fp: values[14],
+                leaf_version: values[15],
               });
             },
           };

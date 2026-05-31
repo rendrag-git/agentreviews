@@ -1,5 +1,10 @@
 import type { Env } from '../types';
 import { parseAlertEvidence, redactAlertEvidence } from '../lib/alert-evidence';
+import { buildMitigationClearLogEntries } from '../lib/mitigation-log';
+import {
+  GENESIS_PREV_HASH,
+  type LogEntry,
+} from '../lib/transparency-log';
 
 interface OpsAlertRow {
   id: string;
@@ -16,6 +21,11 @@ interface OpsAlertRow {
   last_seen_at: number;
   cleared_at: number | null;
   mitigation_count: number;
+}
+
+interface ActiveMitigationRow {
+  review_id: string;
+  alert_id: string;
 }
 
 const OPS_TOKEN_ACTOR = 'ops-token';
@@ -90,13 +100,16 @@ export async function handleDismissOpsAlert(
   if (body instanceof Response) return body;
 
   const activeMitigations = await env.DB.prepare(
-    'SELECT COUNT(*) AS count FROM review_mitigations WHERE alert_id = ? AND cleared_at IS NULL',
+    'SELECT review_id, alert_id FROM review_mitigations WHERE alert_id = ? AND cleared_at IS NULL ORDER BY review_id ASC',
   )
     .bind(alertId)
-    .first<{ count: number }>();
-  const clearedMitigations = Number(activeMitigations?.count || 0);
+    .all<ActiveMitigationRow>();
+  const mitigationRows = activeMitigations.results || [];
+  const clearedMitigations = mitigationRows.length;
+  const logStatements = await buildMitigationClearLogStatements(env, mitigationRows, body.reason, now);
 
   await env.DB.batch([
+    ...logStatements,
     env.DB.prepare('UPDATE alerts SET status = ?, cleared_at = ? WHERE id = ?')
       .bind('dismissed', now, alertId),
     env.DB.prepare('UPDATE review_mitigations SET cleared_at = ? WHERE alert_id = ? AND cleared_at IS NULL')
@@ -143,6 +156,59 @@ async function readDismissBody(request: Request): Promise<{ reason: string | nul
 
 function triageEventId(alertId: string, now: number): string {
   return `triage:${alertId}:${now}:dismiss`;
+}
+
+async function buildMitigationClearLogStatements(
+  env: Env,
+  mitigations: ActiveMitigationRow[],
+  reason: string | null,
+  now: number,
+): Promise<D1PreparedStatement[]> {
+  if (mitigations.length === 0) return [];
+  if (!env.OPERATOR_PRIVATE_KEY || !env.OPERATOR_PUBLIC_KEY) {
+    throw new Error('Operator signing key is required to clear mitigations');
+  }
+
+  const tail = await env.DB.prepare('SELECT seq, leaf_hash FROM log_entries ORDER BY seq DESC LIMIT 1')
+    .first<Pick<LogEntry, 'seq' | 'leaf_hash'>>();
+  const entries = await buildMitigationClearLogEntries({
+    env,
+    mitigations,
+    reason,
+    now,
+    startSeq: tail ? tail.seq + 1 : 1,
+    prevHash: tail ? tail.leaf_hash : GENESIS_PREV_HASH,
+  });
+
+  return entries.map((entry) => insertLogEntryStatement(env, entry));
+}
+
+function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO log_entries (
+      seq, event_id, event_type, object_type, object_id,
+      agent_pub, sig, sig_nonce, content_hash, canon_payload, sig_alg,
+      prev_hash, leaf_hash, created_at, conn_fp, leaf_version
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      entry.seq,
+      entry.event_id,
+      entry.event_type,
+      entry.object_type,
+      entry.object_id,
+      entry.agent_pub,
+      entry.sig,
+      entry.sig_nonce,
+      entry.content_hash,
+      entry.canon_payload,
+      entry.sig_alg,
+      entry.prev_hash,
+      entry.leaf_hash,
+      entry.created_at,
+      null,
+      entry.leaf_version ?? 1,
+    );
 }
 
 function opsJson(body: unknown, status = 200): Response {

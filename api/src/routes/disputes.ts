@@ -1,5 +1,6 @@
 import type { AgentAuth, DisputeReviewRequest, Env } from '../types';
 import { connectionFingerprint, requestConnectionFacts } from '../lib/conn-fingerprint';
+import { buildMitigationClearLogEntries } from '../lib/mitigation-log';
 import { hasSignedActionFields, validateSignedDispute, type SignedDisputeValidation } from '../lib/signed-action';
 import {
   buildReviewDisputeLogEntry,
@@ -155,6 +156,14 @@ async function insertSignedDisputeWithLog(
       prevHash,
       createdAt: input.createdAt,
     });
+    const clearEntries = await buildMitigationClearLogEntries({
+      env,
+      mitigations: [{ review_id: input.reviewId, alert_id: input.alertId }],
+      reason: input.reason,
+      now: input.createdAt,
+      startSeq: seq + 1,
+      prevHash: entry.leaf_hash,
+    });
 
     try {
       await env.DB.batch([
@@ -182,6 +191,7 @@ async function insertSignedDisputeWithLog(
             'open',
           ),
         insertLogEntryStatement(env, entry, input.connFp),
+        ...clearEntries.map((clearEntry) => insertLogEntryStatement(env, clearEntry, null)),
         env.DB.prepare(
           'UPDATE review_mitigations SET cleared_at = ? WHERE review_id = ? AND alert_id = ? AND cleared_at IS NULL',
         )

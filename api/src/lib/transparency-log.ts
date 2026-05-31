@@ -32,15 +32,26 @@ export interface FlagLogEntryInput extends Omit<ReviewCreateLogEntryInput, 'revi
 export interface ReviewDisputeLogEntryInput extends Omit<ReviewCreateLogEntryInput, 'reviewId'> {
   disputeId: string;
 }
+export interface MitigationLogEntryInput extends Omit<ReviewCreateLogEntryInput, 'reviewId'> {
+  mitigationId: string;
+}
 
-type LogEventType = 'review.create' | 'review.erase' | 'agent.vouch' | 'review.vote' | 'review.flag' | 'review.dispute';
+type LogEventType =
+  | 'review.create'
+  | 'review.erase'
+  | 'agent.vouch'
+  | 'review.vote'
+  | 'review.flag'
+  | 'review.dispute'
+  | 'mitigation.apply'
+  | 'mitigation.clear';
 type LogLeafVersion = 1 | 2;
 
 export interface LogEntry {
   seq: number;
   event_id: string;
   event_type: LogEventType;
-  object_type: 'review' | 'vouch' | 'vote' | 'flag' | 'dispute';
+  object_type: 'review' | 'vouch' | 'vote' | 'flag' | 'dispute' | 'mitigation';
   object_id: string;
   agent_pub: string;
   sig: string;
@@ -99,11 +110,25 @@ export async function buildReviewDisputeLogEntry(input: ReviewDisputeLogEntryInp
   return buildSignedLogEntry('review.dispute', 'dispute', input.disputeId, input);
 }
 
+export async function buildMitigationClearLogEntry(input: MitigationLogEntryInput): Promise<LogEntry> {
+  return buildSignedLogEntry('mitigation.clear', 'mitigation', input.mitigationId, input);
+}
+
+export async function buildMitigationApplyLogEntry(input: MitigationLogEntryInput): Promise<LogEntry> {
+  return buildSignedLogEntry('mitigation.apply', 'mitigation', input.mitigationId, input);
+}
+
 async function buildSignedLogEntry(
   eventType: LogEventType,
   objectType: LogEntry['object_type'],
   objectId: string,
-  input: ReviewCreateLogEntryInput | VouchLogEntryInput | VoteLogEntryInput | FlagLogEntryInput | ReviewDisputeLogEntryInput,
+  input:
+    | ReviewCreateLogEntryInput
+    | VouchLogEntryInput
+    | VoteLogEntryInput
+    | FlagLogEntryInput
+    | ReviewDisputeLogEntryInput
+    | MitigationLogEntryInput,
 ): Promise<LogEntry> {
   const entryWithoutHash = {
     seq: input.seq,

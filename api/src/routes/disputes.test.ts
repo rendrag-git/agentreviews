@@ -8,6 +8,7 @@ import type { Env } from '../types';
 describe('review disputes', () => {
   it('requires the review author and an active key-bound signed dispute', async () => {
     const keyPair = await generateSigningKeyPair();
+    const operatorKey = await generateSigningKeyPair();
     const db = new FakeDisputeDb({ authorPubkey: keyPair.publicKey });
     const signed = await signedDispute({
       reviewId: 'review-1',
@@ -23,7 +24,11 @@ describe('review disputes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(signed),
       }),
-      { DB: db as unknown as D1Database },
+      {
+        DB: db as unknown as D1Database,
+        OPERATOR_PRIVATE_KEY: operatorKey.privateKey,
+        OPERATOR_PUBLIC_KEY: operatorKey.publicKey,
+      },
       { agent_id: 'author-agent', agent_pseudonym: 'Atlas' },
       'review-1',
       1_780_000_000_000,
@@ -52,6 +57,14 @@ describe('review disputes', () => {
         object_id: 'dispute:review-1:alert-1',
         agent_pub: keyPair.publicKey,
         sig_nonce: 'dispute-nonce-1',
+      }),
+      expect.objectContaining({
+        seq: 2,
+        event_type: 'mitigation.clear',
+        object_type: 'mitigation',
+        object_id: 'review-1:alert-1',
+        agent_pub: operatorKey.publicKey,
+        sig_nonce: 'mitigation-clear:review-1:alert-1:1780000000000',
       }),
     ]);
   });
