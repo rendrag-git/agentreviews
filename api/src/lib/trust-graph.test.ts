@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeTrustScores, vouchBudget } from './trust-graph';
+import { computeTrustScores, effectiveVouchBudget, vouchBudget } from './trust-graph';
 
 describe('trust graph', () => {
   it('assigns zero trust when no trust roots are configured', () => {
@@ -71,5 +71,11 @@ describe('trust graph', () => {
     expect(vouchBudget(1)).toBe(1);
     expect(vouchBudget(3)).toBe(2);
     expect(vouchBudget(7)).toBe(3);
+  });
+
+  it('adds only explicit platform attestation bonus to vouch budget', () => {
+    expect(effectiveVouchBudget(0, 0)).toBe(0);
+    expect(effectiveVouchBudget(0, 1)).toBe(1);
+    expect(effectiveVouchBudget(3, 1)).toBe(3);
   });
 });

@@ -3,6 +3,7 @@ import { computeTrustScores, type TrustEdge } from './trust-graph';
 export interface TrustAgentRow {
   id: string;
   earned_trust: number | null;
+  platform_trust_multiplier?: number | null;
 }
 
 export interface TrustRootRow {
@@ -59,14 +60,26 @@ export function planTrustMaterialization(input: TrustMaterializationInput): Trus
 
   return agents.map((agent) => {
     const trustScore = scores[agent.id] ?? 0;
+    const multiplier = platformMultiplier(agent.platform_trust_multiplier);
+    const boostedTrustScore = clampTrust(trustScore * multiplier);
+    const boostedVouchTrust = (inboundTrust.get(agent.id) ?? 0) * multiplier;
     return {
       id: agent.id,
-      trust_score: trustScore,
-      vouch_trust: inboundTrust.get(agent.id) ?? 0,
-      earned_trust: rootSet.has(agent.id) ? Math.max(agent.earned_trust ?? 0, trustScore) : trustScore,
+      trust_score: boostedTrustScore,
+      vouch_trust: boostedVouchTrust,
+      earned_trust: rootSet.has(agent.id) ? Math.max(agent.earned_trust ?? 0, boostedTrustScore) : boostedTrustScore,
       trust_epoch: input.epoch,
     };
   });
+}
+
+function platformMultiplier(value: number | null | undefined): number {
+  if (!Number.isFinite(value ?? NaN)) return 1;
+  return Math.min(1.5, Math.max(1, value as number));
+}
+
+function clampTrust(value: number): number {
+  return Math.min(1, Math.max(0, value));
 }
 
 function computeInboundVouchTrust(edges: TrustEdge[], scores: Record<string, number>): Map<string, number> {

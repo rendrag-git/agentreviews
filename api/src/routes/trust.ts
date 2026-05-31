@@ -1,7 +1,7 @@
 import type { AgentAuth, Env } from '../types';
 import { ulid } from '../lib/ulid';
 import { validateSignedVouch } from '../lib/signed-vouch';
-import { vouchBudget } from '../lib/trust-graph';
+import { effectiveVouchBudget } from '../lib/trust-graph';
 import { planTrustMaterialization } from '../lib/trust-recompute';
 import {
   buildVouchLogEntry,
@@ -25,6 +25,7 @@ interface AgentTrustRow {
   pubkey: string | null;
   key_status: string | null;
   earned_trust: number | null;
+  platform_vouch_bonus: number | null;
 }
 
 export async function handlePostVouch(
@@ -34,7 +35,14 @@ export async function handlePostVouch(
   targetFingerprint: string,
 ): Promise<Response> {
   const [voucher, vouchee] = await Promise.all([
-    env.DB.prepare('SELECT id, pubkey, key_status, earned_trust FROM agents WHERE id = ?')
+    env.DB.prepare(
+      `SELECT a.id, a.pubkey, a.key_status, a.earned_trust, pk.vouch_bonus AS platform_vouch_bonus
+       FROM agents a
+       LEFT JOIN platform_keys pk
+         ON pk.platform_id = a.attested_platform
+        AND pk.revoked_at IS NULL
+       WHERE a.id = ?`,
+    )
       .bind(auth.agent_id)
       .first<AgentTrustRow>(),
     env.DB.prepare('SELECT id FROM agents WHERE fingerprint = ? AND key_status = ?')
@@ -79,7 +87,7 @@ export async function handlePostVouch(
   )
     .bind(voucher.id)
     .first<{ count: number }>();
-  const budget = vouchBudget(voucher.earned_trust ?? 0);
+  const budget = effectiveVouchBudget(voucher.earned_trust ?? 0, voucher.platform_vouch_bonus ?? 0);
   if ((activeCount?.count ?? 0) >= budget) {
     return Response.json({ error: 'Vouch budget exceeded', vouch_budget: budget }, { status: 403 });
   }
@@ -121,7 +129,14 @@ export async function handlePostVouch(
 
 export async function recomputeTrustScores(env: Env, epoch = Date.now()): Promise<number> {
   const [agentsResult, rootsResult, vouchesResult] = await Promise.all([
-    env.DB.prepare('SELECT id, earned_trust FROM agents ORDER BY id ASC').all<{ id: string; earned_trust: number | null }>(),
+    env.DB.prepare(
+      `SELECT a.id, a.earned_trust, pk.trust_mult AS platform_trust_multiplier
+       FROM agents a
+       LEFT JOIN platform_keys pk
+         ON pk.platform_id = a.attested_platform
+        AND pk.revoked_at IS NULL
+       ORDER BY a.id ASC`,
+    ).all<{ id: string; earned_trust: number | null; platform_trust_multiplier: number | null }>(),
     env.DB.prepare('SELECT agent_id, weight FROM trust_roots WHERE revoked_at IS NULL ORDER BY agent_id ASC').all<{ agent_id: string; weight: number | null }>(),
     env.DB.prepare(
       `SELECT voucher_id, vouchee_id, weight

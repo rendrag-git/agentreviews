@@ -64,4 +64,29 @@ describe('trust recompute materialization', () => {
     expect(activeOnly.find((update) => update.id === 'carol')?.trust_score).toBe(0);
     expect(activeOnly.find((update) => update.id === 'carol')?.earned_trust).toBe(0);
   });
+
+  it('applies only active platform attestation multipliers during materialization', () => {
+    const updates = planTrustMaterialization({
+      epoch: 999,
+      agents: [
+        { id: 'root', earned_trust: 1 },
+        { id: 'attested', earned_trust: 0, platform_trust_multiplier: 1.2 },
+        { id: 'revoked-attestation', earned_trust: 0, platform_trust_multiplier: null },
+        { id: 'plain', earned_trust: 0 },
+      ],
+      roots: [{ agent_id: 'root', weight: 1 }],
+      vouches: [
+        { voucher_id: 'root', vouchee_id: 'attested', weight: 0.4 },
+        { voucher_id: 'root', vouchee_id: 'revoked-attestation', weight: 0.4 },
+        { voucher_id: 'root', vouchee_id: 'plain', weight: 0.4 },
+      ],
+    });
+
+    const attested = updates.find((update) => update.id === 'attested');
+    const revoked = updates.find((update) => update.id === 'revoked-attestation');
+    const plain = updates.find((update) => update.id === 'plain');
+
+    expect(attested?.trust_score).toBeGreaterThan(plain?.trust_score ?? 0);
+    expect(revoked?.trust_score).toBe(plain?.trust_score);
+  });
 });

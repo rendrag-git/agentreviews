@@ -3,7 +3,8 @@ import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
 import { generateApiKey, hashKey } from '../middleware/auth';
 import { ulid } from '../lib/ulid';
 import { agentFingerprint, verifyRegistrationProof } from '../lib/agent-identity';
-import { vouchBudget } from '../lib/trust-graph';
+import { verifyPlatformAttestation } from '../lib/platform-attestation';
+import { effectiveVouchBudget } from '../lib/trust-graph';
 import { registrationBucket, releaseRegistrationPow, validateRegistrationPow } from './pow';
 
 // --------------------------------------------------------------------------
@@ -59,6 +60,7 @@ export async function handleRegister(
   }
 
   let fingerprint: string | null = null;
+  let attestedPlatform: string | null = null;
   if (hasKeyBinding) {
     if (!body.pubkey || !body.proof || typeof body.proof_ts !== 'number') {
       return Response.json(
@@ -82,6 +84,45 @@ export async function handleRegister(
     }
 
     fingerprint = await agentFingerprint(body.pubkey);
+
+    if (body.platform_attestation) {
+      const platformId = body.platform_attestation.platform_id;
+      const issuedAt = body.platform_attestation.issued_at;
+      const sig = body.platform_attestation.sig;
+      if (!platformId || !sig || typeof issuedAt !== 'number') {
+        return Response.json(
+          { error: 'Platform attestation requires platform_id, sig, and issued_at' },
+          { status: 400 },
+        );
+      }
+
+      const platform = await env.DB.prepare(
+        'SELECT pubkey FROM platform_keys WHERE platform_id = ? AND revoked_at IS NULL',
+      )
+        .bind(platformId)
+        .first<{ pubkey: string }>();
+      if (!platform) {
+        return Response.json({ error: 'Platform attestation is not allowlisted' }, { status: 400 });
+      }
+
+      const attestationValid = await verifyPlatformAttestation({
+        platformPubkey: platform.pubkey,
+        platformId,
+        agentPubkey: body.pubkey,
+        fingerprint,
+        issuedAt,
+        sig,
+      });
+      if (!attestationValid) {
+        return Response.json({ error: 'Invalid platform attestation' }, { status: 400 });
+      }
+      attestedPlatform = platformId;
+    }
+  } else if (body.platform_attestation) {
+    return Response.json(
+      { error: 'Platform attestation requires key-bound registration' },
+      { status: 400 },
+    );
   }
 
   const pow = await validateRegistrationPow(env, asnBucket, body, username);
@@ -98,10 +139,25 @@ export async function handleRegister(
       ? env.DB.prepare(
         `INSERT INTO agents (
           id, username, pseudonym, created_at, api_key_hash,
-          pubkey, fingerprint, key_status, registration_asn_bucket, pow_challenge
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          pubkey, fingerprint, key_status, attested_platform, platform_attested_at, platform_attestation_sig,
+          registration_asn_bucket, pow_challenge
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-        .bind(agentId, username, pseudonym, now, keyHash, body.pubkey, fingerprint, 'active', asnBucket, pow.challenge)
+        .bind(
+          agentId,
+          username,
+          pseudonym,
+          now,
+          keyHash,
+          body.pubkey,
+          fingerprint,
+          'active',
+          attestedPlatform,
+          attestedPlatform ? now : null,
+          body.platform_attestation?.sig ?? null,
+          asnBucket,
+          pow.challenge,
+        )
       : env.DB.prepare(
         `INSERT INTO agents (
           id, username, pseudonym, created_at, api_key_hash,
@@ -150,6 +206,7 @@ export async function handleRegister(
       pseudonym,
       fingerprint,
       key_status: hasKeyBinding ? 'active' : 'legacy',
+      attested_platform: attestedPlatform,
       api_key: apiKey,
       message: 'Save this API key — it cannot be retrieved again.',
     },
@@ -168,8 +225,14 @@ export async function handleGetProfile(
 ): Promise<Response> {
   const agent = await env.DB.prepare(
     `SELECT username, pseudonym, review_count, created_at, fingerprint, key_status,
-            trust_score, earned_trust, vouch_trust, trust_epoch
-     FROM agents WHERE username = ?`,
+            trust_score, earned_trust, vouch_trust, trust_epoch,
+            attested_platform, platform_attested_at,
+            pk.vouch_bonus AS platform_vouch_bonus
+     FROM agents
+     LEFT JOIN platform_keys pk
+       ON pk.platform_id = agents.attested_platform
+      AND pk.revoked_at IS NULL
+     WHERE username = ?`,
   )
     .bind(username)
     .first<Agent>();
@@ -188,7 +251,7 @@ export async function handleGetProfile(
     trust_score: agent.trust_score ?? 0,
     earned_trust: agent.earned_trust ?? 0,
     vouch_trust: agent.vouch_trust ?? 0,
-    vouch_budget: vouchBudget(agent.earned_trust ?? 0),
+    vouch_budget: effectiveVouchBudget(agent.earned_trust ?? 0, agent.platform_vouch_bonus ?? 0),
     roots_configured: (rootState?.active_roots ?? 0) > 0,
   });
 }

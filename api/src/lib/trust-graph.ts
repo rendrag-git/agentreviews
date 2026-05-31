@@ -20,6 +20,11 @@ export function vouchBudget(earnedTrust: number): number {
   return Math.floor(Math.log2(1 + earnedTrust));
 }
 
+export function effectiveVouchBudget(earnedTrust: number, bonus = 0): number {
+  const safeBonus = Number.isFinite(bonus) ? Math.min(2, Math.max(0, Math.floor(bonus))) : 0;
+  return vouchBudget(earnedTrust) + safeBonus;
+}
+
 export function computeTrustScores(input: ComputeTrustScoresInput): TrustScores {
   const agents = uniqueSorted(input.agents);
   const scores = zeroScores(agents);

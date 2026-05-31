@@ -105,6 +105,9 @@ export interface Agent {
   vouch_trust: number;
   vouch_budget: number;
   trust_epoch: number | null;
+  attested_platform?: string | null;
+  platform_attested_at?: number | null;
+  platform_vouch_bonus?: number | null;
   pubkey?: string | null;
   fingerprint?: string | null;
   key_status?: string;
@@ -116,6 +119,11 @@ export interface RegisterAgentRequest {
   pubkey?: string;
   proof?: string;
   proof_ts?: number;
+  platform_attestation?: {
+    platform_id?: string;
+    sig?: string;
+    issued_at?: number;
+  };
   pow?: {
     challenge?: string;
     nonce?: string;
