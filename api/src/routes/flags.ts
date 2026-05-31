@@ -7,6 +7,7 @@ import {
   type LogEntry,
 } from '../lib/transparency-log';
 import { ulid } from '../lib/ulid';
+import { connectionFingerprint, requestConnectionFacts } from '../lib/conn-fingerprint';
 
 // --------------------------------------------------------------------------
 // POST /api/v1/reviews/:id/flag — Flag a review
@@ -59,6 +60,7 @@ export async function handleFlag(
         weight: flagWeight,
         signed,
         createdAt: now,
+        connFp: await connectionFingerprint(requestConnectionFacts(request), env.CONN_FP_SECRET),
       });
     } else {
       await env.DB.prepare(
@@ -118,6 +120,7 @@ async function insertSignedFlagWithLog(
     weight: number;
     signed: Extract<SignedFlagValidation, { ok: true }>;
     createdAt: number;
+    connFp: string | null;
   },
 ): Promise<void> {
   const actionId = ulid();
@@ -166,7 +169,7 @@ async function insertSignedFlagWithLog(
             seq,
             actionId,
           ),
-        insertLogEntryStatement(env, entry),
+        insertLogEntryStatement(env, entry, input.connFp),
       ]);
       return;
     } catch (err: unknown) {
@@ -178,7 +181,7 @@ async function insertSignedFlagWithLog(
   }
 }
 
-function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement {
+function insertLogEntryStatement(env: Env, entry: LogEntry, connFp: string | null): D1PreparedStatement {
   return env.DB.prepare(
     `INSERT INTO log_entries (
       seq, event_id, event_type, object_type, object_id,
@@ -201,7 +204,7 @@ function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement
       entry.prev_hash,
       entry.leaf_hash,
       entry.created_at,
-      null,
+      connFp,
       entry.leaf_version ?? 1,
     );
 }

@@ -3,6 +3,7 @@ export interface Env {
   MEDIA?: R2Bucket;
   OPERATOR_PRIVATE_KEY?: string;
   OPERATOR_PUBLIC_KEY?: string;
+  CONN_FP_SECRET?: string;
 }
 
 export interface AgentAuth {

@@ -8,6 +8,7 @@ import {
   GENESIS_PREV_HASH,
   type LogEntry,
 } from '../lib/transparency-log';
+import { connectionFingerprint, requestConnectionFacts } from '../lib/conn-fingerprint';
 
 interface VouchRequest {
   weight?: number;
@@ -93,6 +94,7 @@ export async function handlePostVouch(
       weight,
       signed,
       createdAt: now,
+      connFp: await connectionFingerprint(requestConnectionFacts(request), env.CONN_FP_SECRET),
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -156,6 +158,7 @@ async function insertSignedVouchWithLog(
     weight: number;
     signed: Extract<Awaited<ReturnType<typeof validateSignedVouch>>, { ok: true }>;
     createdAt: number;
+    connFp: string | null;
   },
 ): Promise<void> {
   const maxAttempts = 2;
@@ -201,7 +204,7 @@ async function insertSignedVouchWithLog(
             input.createdAt,
             seq,
           ),
-        insertLogEntryStatement(env, entry),
+        insertLogEntryStatement(env, entry, input.connFp),
       ]);
       return;
     } catch (err: unknown) {
@@ -213,7 +216,7 @@ async function insertSignedVouchWithLog(
   }
 }
 
-function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement {
+function insertLogEntryStatement(env: Env, entry: LogEntry, connFp: string | null): D1PreparedStatement {
   return env.DB.prepare(
     `INSERT INTO log_entries (
       seq, event_id, event_type, object_type, object_id,
@@ -236,7 +239,7 @@ function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement
       entry.prev_hash,
       entry.leaf_hash,
       entry.created_at,
-      null,
+      connFp,
       entry.leaf_version ?? 1,
     );
 }

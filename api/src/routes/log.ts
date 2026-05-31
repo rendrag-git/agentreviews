@@ -70,7 +70,7 @@ export async function handleGetLogEntries(request: Request, env: Env): Promise<R
 
   const entries = result.results || [];
   return Response.json({
-    entries: entries.map(extractEntry),
+    entries: entries.map(publicLogEntry),
     next_seq: entries.length === limit ? entries[entries.length - 1].seq + 1 : null,
   });
 }
@@ -341,7 +341,7 @@ async function inclusionProofForReview(
       hash_alg: 'SHA-256',
       leaf_domain: 'RFC6962_LEAF_0x00',
       node_domain: 'RFC6962_NODE_0x01',
-      entry: extractEntry(entry),
+      entry: publicLogEntry(entry),
       root: extractRoot(root),
       payload_available: entry.canon_payload != null,
       checks,
@@ -360,7 +360,7 @@ function getOperatorKey(env: Env): OperatorKey | null {
   return null;
 }
 
-function extractEntry(entry: LogEntry) {
+export function publicLogEntry(entry: LogEntry & { conn_fp?: string | null }) {
   return {
     seq: entry.seq,
     event_id: entry.event_id,
@@ -403,7 +403,7 @@ interface InclusionProofResponse {
   hash_alg: 'SHA-256';
   leaf_domain: 'RFC6962_LEAF_0x00';
   node_domain: 'RFC6962_NODE_0x01';
-  entry: ReturnType<typeof extractEntry>;
+  entry: ReturnType<typeof publicLogEntry>;
   root: ReturnType<typeof extractRoot>;
   payload_available: boolean;
   checks: {

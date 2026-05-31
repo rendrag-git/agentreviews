@@ -17,6 +17,7 @@ import {
   GENESIS_PREV_HASH,
   type LogEntry,
 } from '../lib/transparency-log';
+import { connectionFingerprint, requestConnectionFacts } from '../lib/conn-fingerprint';
 
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
@@ -193,6 +194,7 @@ export async function handleSubmitReview(
         reviewId,
         signed,
         createdAt: now,
+        connFp: await connectionFingerprint(requestConnectionFacts(request), env.CONN_FP_SECRET),
       });
     } else {
       await insertReview(null, null).run();
@@ -503,7 +505,12 @@ export async function handleDeleteReview(
     return Response.json({ error: erase.error }, { status: erase.status });
   }
 
-  const result = await eraseReviewContent(env, existing, erase.signedErase);
+  const result = await eraseReviewContent(
+    env,
+    existing,
+    erase.signedErase,
+    await connectionFingerprint(requestConnectionFacts(request), env.CONN_FP_SECRET),
+  );
   if (!result.ok) {
     return Response.json({ error: result.error }, { status: result.status });
   }
@@ -556,7 +563,12 @@ export async function handleDeleteAllMyReviews(
   await env.DB.prepare('DELETE FROM votes WHERE agent_id = ?').bind(auth.agent_id).run();
 
   for (const review of reviews) {
-    const result = await eraseReviewContent(env, review, signedErasures.get(review.id) ?? null);
+    const result = await eraseReviewContent(
+      env,
+      review,
+      signedErasures.get(review.id) ?? null,
+      await connectionFingerprint(requestConnectionFacts(request), env.CONN_FP_SECRET),
+    );
     if (!result.ok) {
       return Response.json({ error: result.error, review_id: review.id }, { status: result.status });
     }
@@ -742,6 +754,7 @@ async function insertSignedReviewWithLog(
     reviewId: string;
     signed: Extract<SignedReviewValidation, { ok: true }>;
     createdAt: number;
+    connFp: string | null;
   },
 ): Promise<void> {
   const maxAttempts = 2;
@@ -767,7 +780,7 @@ async function insertSignedReviewWithLog(
     try {
       await env.DB.batch([
         insertReview(input.signed, seq),
-        insertLogEntryStatement(env, entry),
+        insertLogEntryStatement(env, entry, input.connFp),
       ]);
       return;
     } catch (err: unknown) {
@@ -785,6 +798,7 @@ async function eraseReviewContent(
   env: Env,
   review: Review,
   signedErase: Extract<SignedReviewEraseValidation, { ok: true }> | null,
+  connFp: string | null,
 ): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
   const photoKeys = parsePhotoKeys(review.photo_keys);
   if (photoKeys.length > 0) {
@@ -845,7 +859,7 @@ async function eraseReviewContent(
            WHERE event_type = ? AND object_type = ? AND object_id = ? AND leaf_version = ?`,
         )
           .bind('review.create', 'review', review.id, 2),
-        insertLogEntryStatement(env, entry),
+        insertLogEntryStatement(env, entry, connFp),
         env.DB.prepare('DELETE FROM votes WHERE review_id = ?').bind(review.id),
       ]);
       return { ok: true };
@@ -891,7 +905,7 @@ function eraseReviewProjectionStatement(
     .bind(erasedAt, erasureLogSeq, erasedAt, reviewId);
 }
 
-function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement {
+function insertLogEntryStatement(env: Env, entry: LogEntry, connFp: string | null): D1PreparedStatement {
   return env.DB.prepare(
     `INSERT INTO log_entries (
       seq, event_id, event_type, object_type, object_id,
@@ -914,7 +928,7 @@ function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement
       entry.prev_hash,
       entry.leaf_hash,
       entry.created_at,
-      null,
+      connFp,
       entry.leaf_version ?? 1,
     );
 }

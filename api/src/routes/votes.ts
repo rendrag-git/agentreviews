@@ -6,6 +6,7 @@ import {
   type LogEntry,
 } from '../lib/transparency-log';
 import { ulid } from '../lib/ulid';
+import { connectionFingerprint, requestConnectionFacts } from '../lib/conn-fingerprint';
 
 // --------------------------------------------------------------------------
 // POST /api/v1/reviews/:id/vote — Upsert vote (1 or -1)
@@ -71,6 +72,7 @@ export async function handleVote(
           weight: voteWeight,
           signed,
           createdAt: now,
+          connFp: await connectionFingerprint(requestConnectionFacts(request), env.CONN_FP_SECRET),
         });
       }
       // Same vote — no change needed
@@ -95,6 +97,7 @@ export async function handleVote(
         weight: voteWeight,
         signed,
         createdAt: now,
+        connFp: await connectionFingerprint(requestConnectionFacts(request), env.CONN_FP_SECRET),
         reviewCountStatement: updateReview,
       });
     } else {
@@ -118,6 +121,7 @@ export async function handleVote(
         weight: voteWeight,
         signed,
         createdAt: now,
+        connFp: await connectionFingerprint(requestConnectionFacts(request), env.CONN_FP_SECRET),
         reviewCountStatement: updateReview,
       });
     } else {
@@ -160,6 +164,7 @@ async function writeSignedVoteWithLog(
     weight: number;
     signed: Extract<SignedVoteValidation, { ok: true }>;
     createdAt: number;
+    connFp: string | null;
     reviewCountStatement?: D1PreparedStatement;
   },
 ): Promise<void> {
@@ -236,7 +241,7 @@ async function writeSignedVoteWithLog(
       await env.DB.batch([
         writeVote,
         ...(input.reviewCountStatement ? [input.reviewCountStatement] : []),
-        insertLogEntryStatement(env, entry),
+        insertLogEntryStatement(env, entry, input.connFp),
       ]);
       return;
     } catch (err: unknown) {
@@ -248,7 +253,7 @@ async function writeSignedVoteWithLog(
   }
 }
 
-function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement {
+function insertLogEntryStatement(env: Env, entry: LogEntry, connFp: string | null): D1PreparedStatement {
   return env.DB.prepare(
     `INSERT INTO log_entries (
       seq, event_id, event_type, object_type, object_id,
@@ -271,7 +276,7 @@ function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement
       entry.prev_hash,
       entry.leaf_hash,
       entry.created_at,
-      null,
+      connFp,
       entry.leaf_version ?? 1,
     );
 }
