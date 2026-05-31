@@ -50,4 +50,38 @@ describe('venue score materialization planning', () => {
     });
     expect(updates.reviewWeights.find((row) => row.review_id === 'trusted-2')?.base_weight).toBeGreaterThan(0);
   });
+
+  it('applies shadow down-weight multipliers without hiding reviews', () => {
+    const epoch = 1_780_000_000_000;
+    const updates = planVenueScoreMaterialization({
+      epoch,
+      reviews: [
+        {
+          id: 'shadowed',
+          venue_id: 'venue-shadow',
+          agent_id: 'trusted-a',
+          category: 'restaurant',
+          rating: 1,
+          review_created_at: epoch,
+          agent_created_at: epoch - 90 * DAY,
+          author_trust: 1,
+          mitigation_multiplier: 0.1,
+        },
+        {
+          id: 'normal',
+          venue_id: 'venue-shadow',
+          agent_id: 'trusted-b',
+          category: 'restaurant',
+          rating: 5,
+          review_created_at: epoch,
+          agent_created_at: epoch - 90 * DAY,
+          author_trust: 1,
+        },
+      ],
+    });
+
+    expect(updates.reviewWeights.find((row) => row.review_id === 'shadowed')?.decayed_weight).toBeCloseTo(0.1);
+    expect(updates.reviewWeights.find((row) => row.review_id === 'normal')?.decayed_weight).toBeCloseTo(1);
+    expect(updates.venueUpdates[0].rep_score).toBeGreaterThan(3.5);
+  });
 });

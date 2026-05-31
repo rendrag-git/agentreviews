@@ -24,6 +24,7 @@ export interface ReviewScoreInput {
   author_trust: number;
   upvote_weight?: number;
   downvote_weight?: number;
+  mitigation_multiplier?: number | null;
   cluster_id?: string | null;
 }
 
@@ -73,11 +74,13 @@ export function reviewBaseWeight(input: {
   author_trust: number;
   upvote_weight?: number;
   downvote_weight?: number;
+  mitigation_multiplier?: number | null;
 }): number {
   const trust = finiteNonNegative(input.author_trust);
   const ageRamp = accountAgeFactor(input.now, input.agent_created_at);
   const vote = voteFactor(input.upvote_weight ?? 0, input.downvote_weight ?? 0);
-  return roundWeight(trust * ageRamp * vote);
+  const mitigation = mitigationFactor(input.mitigation_multiplier);
+  return roundWeight(trust * ageRamp * vote * mitigation);
 }
 
 export function decayFactor(category: Category | string, ageDays: number): number {
@@ -102,6 +105,7 @@ function computeVenueScore(
       author_trust: review.author_trust,
       upvote_weight: review.upvote_weight,
       downvote_weight: review.downvote_weight,
+      mitigation_multiplier: review.mitigation_multiplier,
     });
     const decayedWeight = roundWeight(baseWeight * decayFactor(review.category, ageDays));
     return {
@@ -154,6 +158,12 @@ function accountAgeFactor(now: number, agentCreatedAt: number): number {
 
 function voteFactor(upvoteWeight: number, downvoteWeight: number): number {
   return clamp(1 + 0.1 * finiteNonNegative(upvoteWeight) - 0.1 * finiteNonNegative(downvoteWeight), 0.5, 1.5);
+}
+
+function mitigationFactor(value: number | null | undefined): number {
+  if (value === null || value === undefined) return 1;
+  if (!Number.isFinite(value)) return 1;
+  return clamp(value, 0, 1);
 }
 
 function clampRating(rating: number): number {

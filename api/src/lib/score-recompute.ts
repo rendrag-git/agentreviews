@@ -11,6 +11,7 @@ export interface ScoreReviewRow {
   author_trust: number | null;
   upvote_weight?: number | null;
   downvote_weight?: number | null;
+  mitigation_multiplier?: number | null;
   cluster_id?: string | null;
 }
 
@@ -54,6 +55,7 @@ export function planVenueScoreMaterialization(input: VenueScoreMaterializationIn
     author_trust: review.author_trust ?? 0,
     upvote_weight: review.upvote_weight ?? 0,
     downvote_weight: review.downvote_weight ?? 0,
+    mitigation_multiplier: review.mitigation_multiplier,
     cluster_id: review.cluster_id,
   }));
   const scores = computeVenueScores({

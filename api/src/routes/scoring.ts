@@ -14,10 +14,12 @@ export async function recomputeVenueScores(env: Env, epoch = Date.now()): Promis
        a.created_at AS agent_created_at,
        a.trust_score AS author_trust,
        COALESCE(SUM(CASE WHEN v.vote = 1 AND v.signed = 1 THEN v.weight ELSE 0 END), 0) AS upvote_weight,
-       COALESCE(SUM(CASE WHEN v.vote = -1 AND v.signed = 1 THEN v.weight ELSE 0 END), 0) AS downvote_weight
+       COALESCE(SUM(CASE WHEN v.vote = -1 AND v.signed = 1 THEN v.weight ELSE 0 END), 0) AS downvote_weight,
+       COALESCE(rm.multiplier, 1) AS mitigation_multiplier
      FROM reviews r
      JOIN agents a ON a.id = r.agent_id
      LEFT JOIN votes v ON v.review_id = r.id
+     LEFT JOIN review_mitigations rm ON rm.review_id = r.id AND rm.cleared_at IS NULL
      WHERE r.moderation_state = 'visible'
        AND r.erased_at IS NULL
      GROUP BY r.id
