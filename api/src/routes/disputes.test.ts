@@ -49,6 +49,11 @@ describe('review disputes', () => {
     ]);
     expect(db.alerts.get('alert-1')).toEqual(expect.objectContaining({ status: 'disputed' }));
     expect(db.mitigations[0].cleared_at).toBe(1_780_000_000_000);
+    expect(db.reviews.get('review-1')).toEqual({
+      id: 'review-1',
+      moderation_state: 'visible',
+      moderation_updated_at: 1_780_000_000_000,
+    });
     expect(db.logEntries).toEqual([
       expect.objectContaining({
         seq: 1,
@@ -67,6 +72,45 @@ describe('review disputes', () => {
         sig_nonce: 'mitigation-clear:review-1:alert-1:1780000000000',
       }),
     ]);
+  });
+
+  it('restores the review to its pre-quarantine moderation state when disputed', async () => {
+    const keyPair = await generateSigningKeyPair();
+    const operatorKey = await generateSigningKeyPair();
+    const db = new FakeDisputeDb({
+      authorPubkey: keyPair.publicKey,
+      restoreModerationState: 'soft_hidden',
+    });
+    const signed = await signedDispute({
+      reviewId: 'review-1',
+      alertId: 'alert-1',
+      reason: 'legitimate but previously soft-hidden',
+      nonce: 'dispute-nonce-soft-hidden',
+      keyPair,
+    });
+
+    const response = await handleDisputeReview(
+      new Request('https://api.test/api/v1/reviews/review-1/dispute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(signed),
+      }),
+      {
+        DB: db as unknown as D1Database,
+        OPERATOR_PRIVATE_KEY: operatorKey.privateKey,
+        OPERATOR_PUBLIC_KEY: operatorKey.publicKey,
+      },
+      { agent_id: 'author-agent', agent_pseudonym: 'Atlas' },
+      'review-1',
+      1_780_000_000_000,
+    );
+
+    expect(response.status).toBe(201);
+    expect(db.reviews.get('review-1')).toEqual({
+      id: 'review-1',
+      moderation_state: 'soft_hidden',
+      moderation_updated_at: 1_780_000_000_000,
+    });
   });
 
   it('rejects disputes from non-authors without mutating state', async () => {
@@ -185,16 +229,38 @@ async function signedDispute(input: {
 
 class FakeDisputeDb {
   readonly alerts = new Map<string, { id: string; status: string; cleared_at: number | null }>();
-  readonly mitigations = [{ review_id: 'review-1', alert_id: 'alert-1', cleared_at: null as number | null }];
+  readonly mitigations: Array<{
+    review_id: string;
+    alert_id: string;
+    cleared_at: number | null;
+    restore_moderation_state: string | null;
+  }>;
+  readonly reviews = new Map<string, { id: string; moderation_state: string; moderation_updated_at: number | null }>();
   readonly disputes: Array<Record<string, unknown>> = [];
   readonly logEntries: Array<Record<string, unknown>> = [];
   private existingDispute: boolean;
   private activeMitigation: boolean;
 
-  constructor(input: { authorPubkey: string; existingDispute?: boolean; activeMitigation?: boolean }) {
+  constructor(input: {
+    authorPubkey: string;
+    existingDispute?: boolean;
+    activeMitigation?: boolean;
+    restoreModerationState?: string | null;
+  }) {
     this.authorPubkey = input.authorPubkey;
     this.existingDispute = Boolean(input.existingDispute);
     this.activeMitigation = input.activeMitigation ?? true;
+    this.mitigations = [{
+      review_id: 'review-1',
+      alert_id: 'alert-1',
+      cleared_at: null,
+      restore_moderation_state: input.restoreModerationState ?? 'visible',
+    }];
+    this.reviews.set('review-1', {
+      id: 'review-1',
+      moderation_state: 'quarantined',
+      moderation_updated_at: 100,
+    });
     this.alerts.set('alert-1', { id: 'alert-1', status: 'open', cleared_at: null });
   }
 
@@ -215,7 +281,7 @@ class FakeDisputeDb {
         if (sql.includes('SELECT pubkey, key_status FROM agents')) {
           return { first: async () => ({ pubkey: this.authorPubkey, key_status: 'active' }) };
         }
-        if (sql.includes('FROM review_mitigations rm')) {
+        if (sql.includes('SELECT rm.alert_id') && sql.includes('FROM review_mitigations rm')) {
           return { first: async () => (this.activeMitigation ? { alert_id: 'alert-1' } : null) };
         }
         if (sql.includes('SELECT id FROM review_disputes')) {
@@ -270,6 +336,25 @@ class FakeDisputeDb {
               if (alert) {
                 alert.status = String(values[0]);
                 alert.cleared_at = Number(values[1]);
+              }
+            },
+          };
+        }
+        if (sql.includes('UPDATE reviews') && sql.includes('restore_moderation_state')) {
+          return {
+            run: async () => {
+              const alertId = String(values[0]);
+              const clearedAt = Number(values[1]);
+              const reviewId = String(values[3]);
+              const review = this.reviews.get(reviewId);
+              const mitigation = this.mitigations.find((row) => (
+                row.review_id === reviewId &&
+                row.alert_id === alertId &&
+                row.cleared_at === clearedAt
+              ));
+              if (review && review.moderation_state === 'quarantined') {
+                review.moderation_state = mitigation?.restore_moderation_state || 'visible';
+                review.moderation_updated_at = Number(values[2]);
               }
             },
           };

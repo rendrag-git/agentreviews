@@ -29,7 +29,7 @@ interface ActiveMitigationRow {
 }
 
 const OPS_TOKEN_ACTOR = 'ops-token';
-const ALLOWED_ALERT_STATUSES = new Set(['open', 'dismissed', 'disputed']);
+const ALLOWED_ALERT_STATUSES = new Set(['open', 'confirmed', 'dismissed', 'disputed']);
 
 export async function handleListOpsAlerts(request: Request, env: Env): Promise<Response> {
   const auth = requireOpsAuth(request, env);
@@ -115,6 +115,25 @@ export async function handleDismissOpsAlert(
     env.DB.prepare('UPDATE review_mitigations SET cleared_at = ? WHERE alert_id = ? AND cleared_at IS NULL')
       .bind(now, alertId),
     env.DB.prepare(
+      `UPDATE reviews
+       SET moderation_state = COALESCE((
+             SELECT rm.restore_moderation_state
+             FROM review_mitigations rm
+             WHERE rm.review_id = reviews.id
+               AND rm.alert_id = ?
+               AND rm.cleared_at = ?
+             LIMIT 1
+           ), 'visible'),
+           moderation_updated_at = ?
+       WHERE moderation_state = 'quarantined'
+         AND id IN (
+           SELECT review_id FROM review_mitigations
+           WHERE alert_id = ?
+             AND cleared_at = ?
+         )`,
+    )
+      .bind(alertId, now, now, alertId, now),
+    env.DB.prepare(
       `INSERT INTO alert_triage_events (id, alert_id, action, reason, actor, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
     )
@@ -126,6 +145,41 @@ export async function handleDismissOpsAlert(
     status: 'dismissed',
     cleared_mitigations: clearedMitigations,
   });
+}
+
+export async function handleConfirmOpsAlert(
+  request: Request,
+  env: Env,
+  alertId: string,
+  now = Date.now(),
+): Promise<Response> {
+  const auth = requireOpsAuth(request, env);
+  if (auth) return auth;
+
+  const alert = await env.DB.prepare('SELECT id, status FROM alerts WHERE id = ?')
+    .bind(alertId)
+    .first<{ id: string; status: string }>();
+  if (!alert) {
+    return opsJson({ error: 'Alert not found' }, 404);
+  }
+  if (alert.status === 'confirmed') {
+    return opsJson({ alert_id: alertId, status: 'confirmed' });
+  }
+
+  const body = await readDismissBody(request);
+  if (body instanceof Response) return body;
+
+  await env.DB.batch([
+    env.DB.prepare('UPDATE alerts SET status = ? WHERE id = ?')
+      .bind('confirmed', alertId),
+    env.DB.prepare(
+      `INSERT INTO alert_triage_events (id, alert_id, action, reason, actor, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(triageEventId(alertId, now, 'confirm'), alertId, 'confirm', body.reason, OPS_TOKEN_ACTOR, now),
+  ]);
+
+  return opsJson({ alert_id: alertId, status: 'confirmed' });
 }
 
 function requireOpsAuth(request: Request, env: Env): Response | null {
@@ -154,8 +208,8 @@ async function readDismissBody(request: Request): Promise<{ reason: string | nul
   }
 }
 
-function triageEventId(alertId: string, now: number): string {
-  return `triage:${alertId}:${now}:dismiss`;
+function triageEventId(alertId: string, now: number, action = 'dismiss'): string {
+  return `triage:${alertId}:${now}:${action}`;
 }
 
 async function buildMitigationClearLogStatements(

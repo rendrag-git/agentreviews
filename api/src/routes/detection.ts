@@ -273,12 +273,24 @@ export async function persistDetectorPlan(
     }
   }
 
+  const criticalAlertIds = new Set(
+    plan.alerts
+      .filter((alert) => alert.severity === 'critical')
+      .map((alert) => alert.id),
+  );
+
   for (const mitigation of plan.reviewMitigations) {
+    const critical = criticalAlertIds.has(mitigation.alert_id);
     statements.push(env.DB.prepare(
       `INSERT INTO review_mitigations (
-         review_id, alert_id, venue_id, multiplier, reason, created_at, cleared_at
+         review_id, alert_id, venue_id, multiplier, reason, created_at, cleared_at,
+         restore_moderation_state
        )
-       SELECT ?, ?, ?, ?, ?, ?, NULL
+       SELECT ?, ?, ?, ?, ?, ?, NULL,
+              CASE
+                WHEN ? THEN (SELECT moderation_state FROM reviews WHERE id = ?)
+                ELSE NULL
+              END
        WHERE EXISTS (
          SELECT 1 FROM alerts
          WHERE id = ?
@@ -291,6 +303,10 @@ export async function persistDetectorPlan(
            multiplier = excluded.multiplier,
            reason = excluded.reason,
            created_at = excluded.created_at,
+           restore_moderation_state = COALESCE(
+             review_mitigations.restore_moderation_state,
+             excluded.restore_moderation_state
+           ),
            cleared_at = CASE
              WHEN EXISTS (
                SELECT 1 FROM alerts
@@ -308,8 +324,22 @@ export async function persistDetectorPlan(
       mitigation.multiplier,
       mitigation.reason,
       mitigation.created_at,
+      critical ? 1 : 0,
+      mitigation.review_id,
       mitigation.alert_id,
     ));
+  }
+
+  for (const mitigation of plan.reviewMitigations) {
+    if (!criticalAlertIds.has(mitigation.alert_id)) continue;
+    statements.push(env.DB.prepare(
+      `UPDATE reviews
+       SET moderation_state = 'quarantined',
+           moderation_updated_at = ?
+       WHERE id = ?
+         AND moderation_state != 'quarantined'
+         AND erased_at IS NULL`,
+    ).bind(epoch, mitigation.review_id));
   }
 
   await env.DB.batch(statements);

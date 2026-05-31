@@ -381,6 +381,50 @@ export async function handleSearchReviews(
 }
 
 // --------------------------------------------------------------------------
+// GET /api/v1/reviews/:id — Direct-link review read
+// --------------------------------------------------------------------------
+
+export async function handleGetReviewById(
+  _request: Request,
+  env: Env,
+  reviewId: string,
+  auth?: AgentAuth,
+): Promise<Response> {
+  const row = await env.DB.prepare(
+    `SELECT r.*, v.id AS v_id, v.name AS v_name, v.lat AS v_lat, v.lng AS v_lng,
+            v.geo_hash AS v_geo_hash, v.city AS v_city, v.region AS v_region,
+            v.country AS v_country, v.external_id AS v_external_id,
+            v.created_at AS v_created_at, v.review_count AS v_review_count,
+            v.avg_rating AS v_avg_rating,
+            v.google_rating AS v_google_rating, v.google_review_count AS v_google_review_count,
+            v.yelp_rating AS v_yelp_rating, v.yelp_review_count AS v_yelp_review_count,
+            v.external_ratings_updated_at AS v_external_ratings_updated_at,
+            v.rep_score AS v_rep_score, v.rep_confidence AS v_rep_confidence,
+            v.rep_rank AS v_rep_rank, v.rep_epoch AS v_rep_epoch
+     FROM reviews r
+     JOIN venues v ON r.venue_id = v.id
+     WHERE r.id = ?
+       AND r.erased_at IS NULL
+       AND r.moderation_state IN ('visible', 'quarantined')`,
+  )
+    .bind(reviewId)
+    .first<Record<string, unknown>>();
+
+  if (!row) {
+    return Response.json({ error: 'Review not found' }, { status: 404 });
+  }
+
+  const review = extractReview(row);
+  const viewerIsAuthor = auth?.agent_id === review.agent_id;
+  return Response.json({
+    ...review,
+    venue: extractVenue(row),
+    under_review: review.moderation_state === 'quarantined',
+    viewer_is_author: viewerIsAuthor,
+  });
+}
+
+// --------------------------------------------------------------------------
 // PUT /api/v1/reviews/:id — Update review (author only)
 // --------------------------------------------------------------------------
 
@@ -616,6 +660,56 @@ export async function handleAgentReviews(
   const reviews = (result.results || []).map((row: Record<string, unknown>) => ({
     ...extractReview(row),
     venue: extractVenue(row),
+  }));
+
+  return Response.json({
+    reviews,
+    count: reviews.length,
+    next_cursor: nextCursor(reviews, limit),
+  });
+}
+
+// --------------------------------------------------------------------------
+// GET /api/v1/reviews/agent/me — Authenticated author's reviews
+// --------------------------------------------------------------------------
+
+export async function handleMyReviews(
+  request: Request,
+  env: Env,
+  auth: AgentAuth,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const { cursor, limit } = parsePagination(url);
+  const { clause: cursorCl, binds: cursorBinds } = cursorClause(cursor, 'r.id');
+
+  const sql = `
+    SELECT r.*, v.id AS v_id, v.name AS v_name, v.lat AS v_lat, v.lng AS v_lng,
+           v.geo_hash AS v_geo_hash, v.city AS v_city, v.region AS v_region,
+           v.country AS v_country, v.external_id AS v_external_id,
+           v.created_at AS v_created_at, v.review_count AS v_review_count,
+           v.avg_rating AS v_avg_rating,
+           v.google_rating AS v_google_rating, v.google_review_count AS v_google_review_count,
+           v.yelp_rating AS v_yelp_rating, v.yelp_review_count AS v_yelp_review_count,
+           v.external_ratings_updated_at AS v_external_ratings_updated_at,
+           v.rep_score AS v_rep_score, v.rep_confidence AS v_rep_confidence,
+           v.rep_rank AS v_rep_rank, v.rep_epoch AS v_rep_epoch
+    FROM reviews r
+    JOIN venues v ON r.venue_id = v.id
+    WHERE r.agent_id = ?
+      AND r.erased_at IS NULL
+      AND r.moderation_state IN ('visible', 'quarantined')
+      ${cursorCl}
+    ORDER BY r.id DESC
+    LIMIT ?
+  `;
+
+  const allBinds = [auth.agent_id, ...cursorBinds, limit];
+  const result = await env.DB.prepare(sql).bind(...allBinds).all();
+  const reviews = (result.results || []).map((row: Record<string, unknown>) => ({
+    ...extractReview(row),
+    venue: extractVenue(row),
+    under_review: row.moderation_state === 'quarantined',
+    viewer_is_author: true,
   }));
 
   return Response.json({

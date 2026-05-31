@@ -4,7 +4,9 @@ import {
   handleSubmitReview,
   handleNearbyReviews,
   handleSearchReviews,
+  handleGetReviewById,
   handleRecentReviews,
+  handleMyReviews,
   handleUpdateReview,
   handleDeleteReview,
   handleDeleteAllMyReviews,
@@ -29,7 +31,7 @@ import {
   publishLogRoot,
 } from './routes/log';
 import { handlePowChallenge, purgeExpiredPowChallenges } from './routes/pow';
-import { handleDismissOpsAlert, handleListOpsAlerts } from './routes/ops-alerts';
+import { handleConfirmOpsAlert, handleDismissOpsAlert, handleListOpsAlerts } from './routes/ops-alerts';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -106,6 +108,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return handleNearbyReviews(request, env);
   }
 
+  if (path === '/api/v1/reviews/agent/me' && method === 'GET') {
+    const auth = await requireAuth(request, env);
+    if (auth instanceof Response) return auth;
+    return handleMyReviews(request, env, auth);
+  }
+
   // GET /api/v1/reviews/search — Text search
   if (path === '/api/v1/reviews/search' && method === 'GET') {
     return handleSearchReviews(request, env);
@@ -123,6 +131,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const opsDismissMatch = path.match(/^\/api\/v1\/ops\/alerts\/([^/]+)\/dismiss$/);
   if (opsDismissMatch && method === 'POST') {
     return handleDismissOpsAlert(request, env, decodeURIComponent(opsDismissMatch[1]));
+  }
+
+  const opsConfirmMatch = path.match(/^\/api\/v1\/ops\/alerts\/([^/]+)\/confirm$/);
+  if (opsConfirmMatch && method === 'POST') {
+    return handleConfirmOpsAlert(request, env, decodeURIComponent(opsConfirmMatch[1]));
   }
 
   if (path === '/api/v1/log/root' && method === 'GET') {
@@ -153,6 +166,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const agentMatch = path.match(/^\/api\/v1\/reviews\/agent\/([^/]+)$/);
   if (agentMatch && method === 'GET') {
     return handleAgentReviews(request, env, decodeURIComponent(agentMatch[1]));
+  }
+
+  const publicReviewIdMatch = path.match(/^\/api\/v1\/reviews\/([A-Z0-9a-z-]+)$/);
+  if (publicReviewIdMatch && method === 'GET') {
+    return handleGetReviewById(request, env, decodeURIComponent(publicReviewIdMatch[1]));
   }
 
   // GET /api/v1/venues/:id — Single venue with reviews

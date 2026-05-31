@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { generateSigningKeyPair } from '../lib/signing';
-import { handleDismissOpsAlert, handleListOpsAlerts } from './ops-alerts';
+import { handleConfirmOpsAlert, handleDismissOpsAlert, handleListOpsAlerts } from './ops-alerts';
 import type { Env } from '../types';
 
 interface AlertRow {
@@ -28,6 +28,13 @@ interface TriageRow {
   reason: string | null;
   actor: string;
   created_at: number;
+}
+
+interface MitigationRow {
+  review_id: string;
+  alert_id: string;
+  cleared_at: number | null;
+  restore_moderation_state?: string | null;
 }
 
 describe('ops alert triage', () => {
@@ -132,6 +139,28 @@ describe('ops alert triage', () => {
     });
   });
 
+  it('can list confirmed alerts for ops follow-up', async () => {
+    const db = new FakeOpsAlertDb([
+      alert({ id: 'confirmed', status: 'confirmed', created_at: 400, mitigation_count: 1 }),
+    ], [
+      { review_id: 'review-active', alert_id: 'confirmed', cleared_at: null },
+    ]);
+
+    const response = await handleListOpsAlerts(
+      new Request('https://api.test/api/v1/ops/alerts?status=confirmed', {
+        headers: { Authorization: 'Bearer ops-secret' },
+      }),
+      { DB: db as unknown as D1Database, OPS_ALERTS_TOKEN: 'ops-secret' },
+    );
+    const body = await response.json() as { alerts: Array<{ id: string; status: string; active_mitigation_count: number }>; count: number };
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      count: 1,
+      alerts: [{ id: 'confirmed', status: 'confirmed', active_mitigation_count: 1 }],
+    });
+  });
+
   it('dismisses an alert, clears active mitigations, and records signed clear events', async () => {
     const operatorKey = await generateSigningKeyPair();
     const db = new FakeOpsAlertDb([
@@ -194,6 +223,52 @@ describe('ops alert triage', () => {
     });
   });
 
+  it('dismisses an alert and restores its quarantined reviews to their previous moderation state', async () => {
+    const operatorKey = await generateSigningKeyPair();
+    const db = new FakeOpsAlertDb([
+      alert({ id: 'alert-1', status: 'open', cleared_at: null }),
+    ], [
+      { review_id: 'review-active', alert_id: 'alert-1', cleared_at: null, restore_moderation_state: 'visible' },
+      { review_id: 'review-soft-hidden', alert_id: 'alert-1', cleared_at: null, restore_moderation_state: 'soft_hidden' },
+    ], [
+      { id: 'review-active', moderation_state: 'quarantined', moderation_updated_at: 100 },
+      { id: 'review-soft-hidden', moderation_state: 'quarantined', moderation_updated_at: 100 },
+      { id: 'review-other', moderation_state: 'quarantined', moderation_updated_at: 100 },
+    ]);
+
+    const response = await handleDismissOpsAlert(
+      new Request('https://api.test/api/v1/ops/alerts/alert-1/dismiss', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ops-secret' },
+      }),
+      {
+        DB: db as unknown as D1Database,
+        OPS_ALERTS_TOKEN: 'ops-secret',
+        OPERATOR_PRIVATE_KEY: operatorKey.privateKey,
+        OPERATOR_PUBLIC_KEY: operatorKey.publicKey,
+      },
+      'alert-1',
+      1_780_000_000_000,
+    );
+
+    expect(response.status).toBe(200);
+    expect(db.reviews.get('review-active')).toEqual({
+      id: 'review-active',
+      moderation_state: 'visible',
+      moderation_updated_at: 1_780_000_000_000,
+    });
+    expect(db.reviews.get('review-soft-hidden')).toEqual({
+      id: 'review-soft-hidden',
+      moderation_state: 'soft_hidden',
+      moderation_updated_at: 1_780_000_000_000,
+    });
+    expect(db.reviews.get('review-other')).toEqual({
+      id: 'review-other',
+      moderation_state: 'quarantined',
+      moderation_updated_at: 100,
+    });
+  });
+
   it('keeps already-dismissed alerts idempotent without rewriting audit state', async () => {
     const db = new FakeOpsAlertDb([
       alert({ id: 'alert-1', status: 'dismissed', cleared_at: 50 }),
@@ -218,23 +293,68 @@ describe('ops alert triage', () => {
     expect(db.alerts.get('alert-1')?.cleared_at).toBe(50);
     expect(db.triageEvents).toHaveLength(0);
   });
+
+  it('confirms an alert without clearing mitigations or restoring quarantined reviews', async () => {
+    const db = new FakeOpsAlertDb([
+      alert({ id: 'alert-1', status: 'open', cleared_at: null }),
+    ], [
+      { review_id: 'review-active', alert_id: 'alert-1', cleared_at: null, restore_moderation_state: 'visible' },
+    ], [
+      { id: 'review-active', moderation_state: 'quarantined', moderation_updated_at: 100 },
+    ]);
+
+    const response = await handleConfirmOpsAlert(
+      new Request('https://api.test/api/v1/ops/alerts/alert-1/confirm', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ops-secret', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'verified campaign' }),
+      }),
+      { DB: db as unknown as D1Database, OPS_ALERTS_TOKEN: 'ops-secret' },
+      'alert-1',
+      1_780_000_000_000,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ alert_id: 'alert-1', status: 'confirmed' });
+    expect(db.alerts.get('alert-1')).toEqual(expect.objectContaining({ status: 'confirmed', cleared_at: null }));
+    expect(db.mitigations[0].cleared_at).toBeNull();
+    expect(db.reviews.get('review-active')).toEqual({
+      id: 'review-active',
+      moderation_state: 'quarantined',
+      moderation_updated_at: 100,
+    });
+    expect(db.triageEvents).toEqual([
+      expect.objectContaining({
+        alert_id: 'alert-1',
+        action: 'confirm',
+        reason: 'verified campaign',
+        actor: 'ops-token',
+        created_at: 1_780_000_000_000,
+      }),
+    ]);
+  });
 });
 
 class FakeOpsAlertDb {
   readonly alerts = new Map<string, AlertRow>();
-  readonly mitigations: Array<{ review_id: string; alert_id: string; cleared_at: number | null }>;
+  readonly mitigations: MitigationRow[];
+  readonly reviews = new Map<string, { id: string; moderation_state: string; moderation_updated_at: number | null }>();
   readonly triageEvents: TriageRow[] = [];
   readonly logEntries: Array<Record<string, unknown>> = [];
   readonly queries: string[] = [];
 
   constructor(
     alerts: AlertRow[] = [],
-    mitigations: Array<{ review_id: string; alert_id: string; cleared_at: number | null }> = [],
+    mitigations: MitigationRow[] = [],
+    reviews: Array<{ id: string; moderation_state: string; moderation_updated_at: number | null }> = [],
   ) {
     for (const row of alerts) {
       this.alerts.set(row.id, row);
     }
     this.mitigations = mitigations;
+    for (const row of reviews) {
+      this.reviews.set(row.id, row);
+    }
   }
 
   prepare(sql: string) {
@@ -284,7 +404,7 @@ class FakeOpsAlertDb {
             first: async () => null,
           };
         }
-        if (sql.includes('UPDATE alerts SET status =')) {
+        if (sql.includes('UPDATE alerts SET status = ?, cleared_at = ?')) {
           return {
             run: async () => {
               const row = this.alerts.get(String(values[2]));
@@ -295,12 +415,47 @@ class FakeOpsAlertDb {
             },
           };
         }
+        if (sql.includes('UPDATE alerts SET status = ? WHERE id = ?')) {
+          return {
+            run: async () => {
+              const row = this.alerts.get(String(values[1]));
+              if (row) {
+                row.status = String(values[0]);
+              }
+            },
+          };
+        }
         if (sql.includes('UPDATE review_mitigations')) {
           return {
             run: async () => {
               for (const row of this.mitigations) {
                 if (row.alert_id === values[1] && row.cleared_at === null) {
                   row.cleared_at = Number(values[0]);
+                }
+              }
+            },
+          };
+        }
+        if (sql.includes('UPDATE reviews') && sql.includes('restore_moderation_state')) {
+          return {
+            run: async () => {
+              const alertId = String(values[0]);
+              const clearedAt = Number(values[1]);
+              const reviewIds = new Set(
+                this.mitigations
+                  .filter((row) => row.alert_id === alertId && row.cleared_at === clearedAt)
+                  .map((row) => row.review_id),
+              );
+              for (const reviewId of reviewIds) {
+                const review = this.reviews.get(reviewId);
+                if (review && review.moderation_state === 'quarantined') {
+                  const mitigation = this.mitigations.find((row) => (
+                    row.review_id === reviewId &&
+                    row.alert_id === alertId &&
+                    row.cleared_at === clearedAt
+                  ));
+                  review.moderation_state = mitigation?.restore_moderation_state || 'visible';
+                  review.moderation_updated_at = Number(values[2]);
                 }
               }
             },

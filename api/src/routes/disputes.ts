@@ -196,6 +196,21 @@ async function insertSignedDisputeWithLog(
           'UPDATE review_mitigations SET cleared_at = ? WHERE review_id = ? AND alert_id = ? AND cleared_at IS NULL',
         )
           .bind(input.createdAt, input.reviewId, input.alertId),
+        env.DB.prepare(
+          `UPDATE reviews
+           SET moderation_state = COALESCE((
+                 SELECT rm.restore_moderation_state
+                 FROM review_mitigations rm
+                 WHERE rm.review_id = reviews.id
+                   AND rm.alert_id = ?
+                   AND rm.cleared_at = ?
+                 LIMIT 1
+               ), 'visible'),
+               moderation_updated_at = ?
+           WHERE id = ?
+             AND moderation_state = 'quarantined'`,
+        )
+          .bind(input.alertId, input.createdAt, input.createdAt, input.reviewId),
         env.DB.prepare('UPDATE alerts SET status = ?, cleared_at = ? WHERE id = ? AND status = ?')
           .bind('disputed', input.createdAt, input.alertId, 'open'),
       ]);

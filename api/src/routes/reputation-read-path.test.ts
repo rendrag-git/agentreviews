@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { encode } from '../lib/geohash';
-import { handleNearbyReviews, handleSearchReviews } from './reviews';
+import { handleGetReviewById, handleMyReviews, handleNearbyReviews, handleSearchReviews } from './reviews';
 import { handleGetVenue } from './venues';
 import type { Env, Venue } from '../types';
 
@@ -31,11 +31,17 @@ class FakeReadPathDb {
             if (sql.includes('LEFT JOIN review_weights rw')) {
               return { results: runVenueReviews(sql, binds, data.venueReviewRows) };
             }
+            if (sql.includes('WHERE r.agent_id = ?')) {
+              return { results: runMyReviews(binds, data.reviewRows) };
+            }
             throw new Error(`Unexpected all() SQL: ${sql}`);
           },
           async first<T>() {
             if (sql.includes('SELECT * FROM venues WHERE id = ?')) {
               return (data.venues.find((venue) => venue.id === binds[0]) ?? null) as T | null;
+            }
+            if (sql.includes('WHERE r.id = ?')) {
+              return (data.reviewRows.find((row) => row.id === binds[0]) ?? null) as T | null;
             }
             throw new Error(`Unexpected first() SQL: ${sql}`);
           },
@@ -132,6 +138,72 @@ describe('reputation read paths', () => {
     expect(body.next_cursor).toBe('0.12:light-review');
   });
 
+  it('direct-link retrieval returns quarantined reviews with under-review state and no detector evidence', async () => {
+    const env = fakeEnv();
+
+    const response = await handleGetReviewById(
+      new Request('https://api.test/api/v1/reviews/quarantined-review'),
+      env,
+      'quarantined-review',
+    );
+    const body = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      id: 'quarantined-review',
+      moderation_state: 'quarantined',
+      under_review: true,
+      venue: expect.objectContaining({ id: 'venue-trusted' }),
+    }));
+    expect(JSON.stringify(body)).not.toContain('suspect_review_ids');
+    expect(JSON.stringify(body)).not.toContain('conn_fp');
+  });
+
+  it('authenticated authors can retrieve their quarantined review through the direct-link path', async () => {
+    const env = fakeEnv();
+
+    const response = await handleGetReviewById(
+      new Request('https://api.test/api/v1/reviews/quarantined-review'),
+      env,
+      'quarantined-review',
+      { agent_id: 'agent-1', agent_pseudonym: 'Atlas' },
+    );
+    const body = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      id: 'quarantined-review',
+      moderation_state: 'quarantined',
+      under_review: true,
+      viewer_is_author: true,
+    }));
+  });
+
+  it('authenticated author feed includes own quarantined reviews but not other agents or soft-hidden rows', async () => {
+    const env = fakeEnv();
+
+    const response = await handleMyReviews(
+      new Request('https://api.test/api/v1/reviews/agent/me?limit=10'),
+      env,
+      { agent_id: 'agent-1', agent_pseudonym: 'Atlas' },
+    );
+    const body = await response.json() as {
+      reviews: Array<{ id: string; moderation_state: string; under_review: boolean; viewer_is_author: boolean }>;
+      count: number;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.reviews.map((review) => review.id)).toContain('quarantined-review');
+    expect(body.reviews.find((review) => review.id === 'quarantined-review')).toEqual(expect.objectContaining({
+      moderation_state: 'quarantined',
+      under_review: true,
+      viewer_is_author: true,
+    }));
+    expect(body.reviews.map((review) => review.id)).not.toContain('other-agent-quarantined-review');
+    expect(body.reviews.map((review) => review.id)).not.toContain('hidden-review');
+    expect(body.count).toBe(body.reviews.length);
+  });
+
   it('venue details returns 404 for a missing venue', async () => {
     const env = fakeEnv();
 
@@ -156,6 +228,8 @@ function fakeEnv(): Env {
     reviewRows: [
       reviewWithVenue({ id: 'swarm-review', venueId: 'venue-swarm', venueName: 'Swarm Cafe', avgRating: 4.9, repScore: 2.0, repConfidence: 0.3, repRank: 1.8, geoHash: centerHash }),
       reviewWithVenue({ id: 'trusted-review', venueId: 'venue-trusted', venueName: 'Trusted Cafe', avgRating: 3.1, repScore: 4.15, repConfidence: 0.82, repRank: 4.2, geoHash: centerHash }),
+      reviewWithVenue({ id: 'quarantined-review', venueId: 'venue-trusted', venueName: 'Trusted Cafe', avgRating: 3.1, repScore: 4.15, repConfidence: 0.82, repRank: 4.2, geoHash: centerHash, moderationState: 'quarantined' }),
+      reviewWithVenue({ id: 'other-agent-quarantined-review', venueId: 'venue-trusted', venueName: 'Trusted Cafe', avgRating: 3.1, repScore: 4.15, repConfidence: 0.82, repRank: 4.2, geoHash: centerHash, moderationState: 'quarantined', agentId: 'agent-2' }),
       reviewWithVenue({ id: 'hidden-review', venueId: 'venue-trusted', venueName: 'Trusted Cafe', avgRating: 3.1, repScore: 4.15, repConfidence: 0.82, repRank: 4.2, geoHash: centerHash, moderationState: 'soft_hidden' }),
       reviewWithVenue({ id: 'outside-review', venueId: 'venue-outside', venueName: 'Outside Diner', avgRating: 5.0, repScore: 5.0, repConfidence: 1.0, repRank: 9.0, geoHash: 'zzzzzz' }),
     ],
@@ -198,6 +272,18 @@ function runVenueReviews(sql: string, binds: unknown[], rows: Row[]): Row[] {
     ? [...matching].sort(compareByScoreThenIdDesc('review_rank_weight'))
     : matching;
   return applyLimit(sorted, binds);
+}
+
+function runMyReviews(binds: unknown[], rows: Row[]): Row[] {
+  const agentId = binds[0];
+  return applyLimit(
+    rows
+      .filter((row) => row.agent_id === agentId)
+      .filter((row) => row.erased_at == null)
+      .filter((row) => row.moderation_state === 'visible' || row.moderation_state === 'quarantined')
+      .sort((left, right) => String(right.id).localeCompare(String(left.id))),
+    binds,
+  );
 }
 
 function applyRepOrderingIfRequested(sql: string, rows: Row[]): Row[] {
@@ -266,11 +352,13 @@ function reviewWithVenue(input: {
   repRank: number;
   geoHash: string;
   moderationState?: string;
+  agentId?: string;
 }): Row {
   return {
     ...review({
       id: input.id,
       venue_id: input.venueId,
+      agent_id: input.agentId ?? 'agent-1',
       moderation_state: input.moderationState ?? 'visible',
     }),
     v_id: input.venueId,
