@@ -110,7 +110,7 @@ export async function handleDismissOpsAlert(
 
   await env.DB.batch([
     ...logStatements,
-    env.DB.prepare('UPDATE alerts SET status = ?, cleared_at = ? WHERE id = ?')
+    env.DB.prepare('UPDATE alerts SET status = ?, cleared_at = ?, pin_expires_at = NULL WHERE id = ?')
       .bind('dismissed', now, alertId),
     env.DB.prepare('UPDATE review_mitigations SET cleared_at = ? WHERE alert_id = ? AND cleared_at IS NULL')
       .bind(now, alertId),
@@ -170,7 +170,7 @@ export async function handleConfirmOpsAlert(
   if (body instanceof Response) return body;
 
   await env.DB.batch([
-    env.DB.prepare('UPDATE alerts SET status = ? WHERE id = ?')
+    env.DB.prepare('UPDATE alerts SET status = ?, pin_expires_at = NULL WHERE id = ?')
       .bind('confirmed', alertId),
     env.DB.prepare(
       `INSERT INTO alert_triage_events (id, alert_id, action, reason, actor, created_at)

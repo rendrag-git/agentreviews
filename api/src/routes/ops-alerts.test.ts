@@ -415,7 +415,7 @@ class FakeOpsAlertDb {
             },
           };
         }
-        if (sql.includes('UPDATE alerts SET status = ? WHERE id = ?')) {
+        if (sql.includes('UPDATE alerts SET status = ?, pin_expires_at = NULL WHERE id = ?')) {
           return {
             run: async () => {
               const row = this.alerts.get(String(values[1]));

@@ -1,5 +1,5 @@
 import type { Env } from '../types';
-import { buildMitigationApplyLogEntries } from '../lib/mitigation-log';
+import { buildMitigationApplyLogEntries, buildMitigationClearLogEntries } from '../lib/mitigation-log';
 import {
   planDetectorMaterialization,
   type DetectorLogEntry,
@@ -11,6 +11,27 @@ import { GENESIS_PREV_HASH, type LogEntry } from '../lib/transparency-log';
 const HOT_PATH_DETECTOR = 'l4_hot_path';
 const DETECTION_BATCH_LIMIT = 1000;
 const DETECTION_WINDOW_MS = 60 * 60 * 1000;
+const RECOVERY_CLEAR_THRESHOLD = 2.5;
+const RECOVERY_QUIET_MS = 24 * 60 * 60 * 1000;
+const RECOVERY_SCORE_HALF_LIFE_MS = 14 * 60 * 60 * 1000;
+const RECOVERY_PIN_MS = 30 * 24 * 60 * 60 * 1000;
+const RECOVERY_AUTO_CLEAR_REASON = 'auto_clear:score_below_threshold';
+
+interface MitigationRecoveryCandidate {
+  alert_id: string;
+  review_id: string;
+  venue_id: string;
+  status: string;
+  type: string;
+  subject_type: string;
+  subject_id: string;
+  evidence_json: string;
+  latest_score: number | null;
+  last_seen_at: number;
+  created_at: number;
+  restore_moderation_state: string | null;
+  cleared_at: number | null;
+}
 
 export async function runDetectors(env: Env, epoch = Date.now()): Promise<DetectorMaterializationPlan> {
   const state = await env.DB.prepare('SELECT cursor_seq FROM detector_state WHERE detector = ?')
@@ -52,6 +73,117 @@ export async function runDetectors(env: Env, epoch = Date.now()): Promise<Detect
 
   await persistDetectorPlan(env, plan, epoch);
   return plan;
+}
+
+export async function runMitigationRecovery(
+  env: Env,
+  epoch = Date.now(),
+): Promise<{ scanned: number; cleared: number }> {
+  const candidatesResult = await env.DB.prepare(
+    `SELECT
+       a.id AS alert_id,
+       rm.review_id,
+       rm.venue_id,
+       a.status,
+       a.type,
+       a.subject_type,
+       a.subject_id,
+       a.evidence_json,
+       latest.score AS latest_score,
+       a.last_seen_at,
+       a.created_at,
+       rm.restore_moderation_state,
+       rm.cleared_at
+     FROM alerts a
+     JOIN review_mitigations rm
+       ON rm.alert_id = a.id
+      AND rm.cleared_at IS NULL
+     LEFT JOIN anomaly_scores latest
+       ON latest.id = (
+         SELECT s.id
+         FROM anomaly_scores s
+         WHERE s.type = a.type
+           AND s.subject_type = a.subject_type
+           AND s.subject_id = a.subject_id
+         ORDER BY s.created_at DESC
+         LIMIT 1
+       )
+     WHERE a.status = 'open'
+       AND a.cleared_at IS NULL
+       AND (a.pin_expires_at IS NULL OR a.pin_expires_at <= ?)
+     ORDER BY a.id ASC, rm.review_id ASC`,
+  )
+    .bind(epoch)
+    .all<MitigationRecoveryCandidate>();
+  const candidates = candidatesResult.results || [];
+  const eligible = candidates.filter((candidate) => shouldAutoClearMitigation(candidate, epoch));
+  if (eligible.length === 0) {
+    return { scanned: candidates.length, cleared: 0 };
+  }
+
+  const statements: D1PreparedStatement[] = [];
+  const tail = await env.DB.prepare('SELECT seq, leaf_hash FROM log_entries ORDER BY seq DESC LIMIT 1')
+    .first<Pick<LogEntry, 'seq' | 'leaf_hash'>>();
+  const clearEntries = await buildMitigationClearLogEntries({
+    env,
+    mitigations: eligible.map((candidate) => ({
+      review_id: candidate.review_id,
+      alert_id: candidate.alert_id,
+    })),
+    reason: RECOVERY_AUTO_CLEAR_REASON,
+    now: epoch,
+    startSeq: tail ? tail.seq + 1 : 1,
+    prevHash: tail ? tail.leaf_hash : GENESIS_PREV_HASH,
+  });
+  for (const entry of clearEntries) {
+    statements.push(insertLogEntryStatement(env, entry));
+  }
+
+  const eligibleByAlert = groupRecoveryCandidatesByAlert(eligible);
+  const pinnedUntil = epoch + RECOVERY_PIN_MS;
+  for (const [alertId, alertCandidates] of eligibleByAlert) {
+    const score = recoveryScore(alertCandidates[0], epoch);
+    statements.push(
+      env.DB.prepare('UPDATE review_mitigations SET cleared_at = ? WHERE alert_id = ? AND cleared_at IS NULL')
+        .bind(epoch, alertId),
+      env.DB.prepare(
+        `UPDATE reviews
+         SET moderation_state = COALESCE((
+               SELECT rm.restore_moderation_state
+               FROM review_mitigations rm
+               WHERE rm.review_id = reviews.id
+                 AND rm.alert_id = ?
+                 AND rm.cleared_at = ?
+               LIMIT 1
+             ), 'visible'),
+             moderation_updated_at = ?
+         WHERE moderation_state = 'quarantined'
+           AND id IN (
+             SELECT review_id FROM review_mitigations
+             WHERE alert_id = ?
+               AND cleared_at = ?
+           )`,
+      )
+        .bind(alertId, epoch, epoch, alertId, epoch),
+      env.DB.prepare('UPDATE alerts SET status = ?, cleared_at = ?, pin_expires_at = ? WHERE id = ? AND status = ?')
+        .bind('dismissed', epoch, pinnedUntil, alertId, 'open'),
+      env.DB.prepare(
+        `INSERT INTO alert_triage_events (id, alert_id, action, reason, actor, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+        .bind(
+          recoveryEventId(alertId, epoch),
+          alertId,
+          'auto_clear',
+          `${RECOVERY_AUTO_CLEAR_REASON};score=${score};threshold=${RECOVERY_CLEAR_THRESHOLD};pin_expires_at=${pinnedUntil}`,
+          'system',
+          epoch,
+        ),
+    );
+  }
+
+  await env.DB.batch(statements);
+  return { scanned: candidates.length, cleared: eligible.length };
 }
 
 async function loadDetectionReviewActions(
@@ -188,6 +320,36 @@ async function loadDetectionReviews(
     .all<VenueCampaignReview>();
 
   return reviews.results || [];
+}
+
+function shouldAutoClearMitigation(candidate: MitigationRecoveryCandidate, epoch: number): boolean {
+  return epoch - candidate.last_seen_at >= RECOVERY_QUIET_MS &&
+    recoveryScore(candidate, epoch) < RECOVERY_CLEAR_THRESHOLD;
+}
+
+function recoveryScore(candidate: MitigationRecoveryCandidate, epoch: number): number {
+  const latestScore = Number.isFinite(candidate.latest_score) ? Number(candidate.latest_score) : 0;
+  const quietMs = Math.max(0, epoch - candidate.last_seen_at);
+  const halfLives = quietMs / RECOVERY_SCORE_HALF_LIFE_MS;
+  return round(latestScore * Math.pow(0.5, halfLives));
+}
+
+function round(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function groupRecoveryCandidatesByAlert(candidates: MitigationRecoveryCandidate[]): Map<string, MitigationRecoveryCandidate[]> {
+  const byAlert = new Map<string, MitigationRecoveryCandidate[]>();
+  for (const candidate of candidates) {
+    const rows = byAlert.get(candidate.alert_id) ?? [];
+    rows.push(candidate);
+    byAlert.set(candidate.alert_id, rows);
+  }
+  return byAlert;
+}
+
+function recoveryEventId(alertId: string, epoch: number): string {
+  return `recovery:${alertId}:${epoch}:auto_clear`;
 }
 
 export async function persistDetectorPlan(

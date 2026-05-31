@@ -18,7 +18,7 @@ import { handleDisputeReview } from './routes/disputes';
 import { handleRegister, handleGetProfile, handleGetReviews } from './routes/agents';
 import { handlePostVouch, recomputeTrustScores } from './routes/trust';
 import { recomputeVenueScores } from './routes/scoring';
-import { runDetectors } from './routes/detection';
+import { runDetectors, runMitigationRecovery } from './routes/detection';
 import { deliverDiscordAlerts } from './lib/alert-delivery';
 import { handleGetVenue, handleResolveVenue } from './routes/venues';
 import {
@@ -62,6 +62,7 @@ export default {
     await purgeExpiredPowChallenges(env);
     await recomputeTrustScores(env);
     const detectorPlan = await runDetectors(env, epoch);
+    await runMitigationRecovery(env, epoch);
     await deliverDiscordAlerts({
       db: env.DB,
       webhookUrl: env.DISCORD_ALERT_WEBHOOK,

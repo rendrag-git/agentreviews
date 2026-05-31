@@ -211,7 +211,7 @@ async function insertSignedDisputeWithLog(
              AND moderation_state = 'quarantined'`,
         )
           .bind(input.alertId, input.createdAt, input.createdAt, input.reviewId),
-        env.DB.prepare('UPDATE alerts SET status = ?, cleared_at = ? WHERE id = ? AND status = ?')
+        env.DB.prepare('UPDATE alerts SET status = ?, cleared_at = ?, pin_expires_at = NULL WHERE id = ? AND status = ?')
           .bind('disputed', input.createdAt, input.alertId, 'open'),
       ]);
       return;
