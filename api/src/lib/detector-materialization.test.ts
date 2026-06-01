@@ -221,4 +221,49 @@ describe('detector materialization planning', () => {
       reviewMitigations: [],
     });
   });
+
+  it('plans dispatch ring persistence for coordinated review clusters without exposing fingerprints', () => {
+    const entries = Array.from({ length: 6 }, (_, index) => ({
+      seq: index + 1,
+      event_type: 'review.create',
+      object_id: `dispatch-review-${index}`,
+      created_at: now - index * 15_000,
+    }));
+    const dispatchReviews = entries.map((entry, index) => ({
+      id: entry.object_id,
+      venue_id: 'venue-ring',
+      agent_id: `ring-agent-${index}`,
+      body: `Spotless stocked bathroom with clear signage and a dry floor ${index % 2}`,
+      tags: ['bathroom'],
+      rating: 5,
+      created_at: entry.created_at,
+      agent_created_at: now - 30 * 60_000,
+      vouch_ancestor_id: 'root-a',
+      conn_fp: 'shared-private-fingerprint',
+      conn_fp_prevalence: 0.05,
+    }));
+
+    const first = planDetectorMaterialization({
+      detector: 'l4_hot_path',
+      cursor_seq: 0,
+      now,
+      windowMs: HOUR,
+      logEntries: entries,
+      reviews: [],
+      dispatchReviews,
+    });
+
+    expect(first.next_cursor_seq).toBe(6);
+    expect(first.rings ?? []).toHaveLength(1);
+    expect(first.ringMembers ?? []).toHaveLength(6);
+    expect(first.reviewSimhashes ?? []).toHaveLength(6);
+    expect(first.alerts[0]).toMatchObject({
+      type: 'dispatch.suspected',
+      subject_type: 'ring',
+      severity: 'critical',
+      auto_action_taken: 'cluster_downrank',
+    });
+    expect(first.rings?.[0].id).toBe(first.alerts[0].subject_id);
+    expect(JSON.stringify(first.alerts)).not.toContain('shared-private-fingerprint');
+  });
 });

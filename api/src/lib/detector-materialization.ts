@@ -1,4 +1,11 @@
 import {
+  detectDispatchRings,
+  minhashSignature,
+  shingleCount,
+  type DispatchRingReview,
+  type DispatchRingDetection,
+} from './dispatch-rings';
+import {
   detectAgentTargeting,
   detectReviewActionSwarms,
   detectVenueReviewCampaigns,
@@ -21,6 +28,7 @@ export interface DetectorMaterializationInput {
   logEntries: DetectorLogEntry[];
   reviews: VenueCampaignReview[];
   reviewActions?: ReviewActionEvent[];
+  dispatchReviews?: DispatchRingReview[];
   windowMs?: number;
 }
 
@@ -61,12 +69,40 @@ export interface ReviewMitigationRow {
   created_at: number;
 }
 
+export interface DispatchRingRow {
+  id: string;
+  venue_id: string;
+  status: string;
+  severity: string;
+  score: number;
+  evidence_json: string;
+  detected_at: number;
+  last_seen_at: number;
+}
+
+export interface RingMemberRow {
+  ring_id: string;
+  agent_id: string;
+  first_seen_at: number;
+  last_seen_at: number;
+}
+
+export interface ReviewSimhashRow {
+  review_id: string;
+  minhash_json: string;
+  shingle_count: number;
+  updated_at: number;
+}
+
 export interface DetectorMaterializationPlan {
   detector: string;
   next_cursor_seq: number;
   anomalyScores: AnomalyScoreRow[];
   alerts: AlertRow[];
   reviewMitigations: ReviewMitigationRow[];
+  rings?: DispatchRingRow[];
+  ringMembers?: RingMemberRow[];
+  reviewSimhashes?: ReviewSimhashRow[];
 }
 
 export function planDetectorMaterialization(input: DetectorMaterializationInput): DetectorMaterializationPlan {
@@ -110,10 +146,17 @@ export function planDetectorMaterialization(input: DetectorMaterializationInput)
     windowMs: input.windowMs,
     actions: candidateActions,
   });
+  const dispatchDetections = detectDispatchRings({
+    now: input.now,
+    reviews: input.dispatchReviews ?? [],
+  });
 
   const anomalyScores: AnomalyScoreRow[] = [];
   const alerts: AlertRow[] = [];
   const reviewMitigations: ReviewMitigationRow[] = [];
+  const rings: DispatchRingRow[] = [];
+  const ringMembers: RingMemberRow[] = [];
+  const reviewSimhashes = planReviewSimhashes(input.dispatchReviews ?? [], input.now);
 
   for (const detection of detections) {
     const evidenceJson = JSON.stringify({
@@ -232,12 +275,57 @@ export function planDetectorMaterialization(input: DetectorMaterializationInput)
     });
   }
 
+  for (const detection of dispatchDetections) {
+    const evidenceJson = JSON.stringify({
+      ...detection.evidence,
+      member_count: detection.member_agent_ids.length,
+      suspect_review_ids: detection.suspect_review_ids,
+      suspected_ring_id: detection.ring_id,
+    });
+    const dedupKey = `${detection.type}:${detection.ring_id}:${sixHourBucket(input.now)}`;
+    anomalyScores.push(anomalyScoreForDispatch(detection, evidenceJson, input.now));
+    alerts.push({
+      id: dedupKey,
+      type: detection.type,
+      subject_type: 'ring',
+      subject_id: detection.ring_id,
+      severity: detection.severity,
+      dedup_key: dedupKey,
+      status: 'open',
+      evidence_json: evidenceJson,
+      auto_action_taken: 'cluster_downrank',
+      created_at: input.now,
+      last_seen_at: input.now,
+    });
+    rings.push({
+      id: detection.ring_id,
+      venue_id: detection.venue_id,
+      status: 'active',
+      severity: detection.severity,
+      score: detection.score,
+      evidence_json: evidenceJson,
+      detected_at: input.now,
+      last_seen_at: input.now,
+    });
+    for (const agentId of detection.member_agent_ids) {
+      ringMembers.push({
+        ring_id: detection.ring_id,
+        agent_id: agentId,
+        first_seen_at: input.now,
+        last_seen_at: input.now,
+      });
+    }
+  }
+
   return {
     detector: input.detector,
     next_cursor_seq: nextCursor,
     anomalyScores,
     alerts,
     reviewMitigations,
+    rings,
+    ringMembers,
+    reviewSimhashes,
   };
 }
 
@@ -248,7 +336,41 @@ function emptyPlan(detector: string, nextCursor: number): DetectorMaterializatio
     anomalyScores: [],
     alerts: [],
     reviewMitigations: [],
+    rings: [],
+    ringMembers: [],
+    reviewSimhashes: [],
   };
+}
+
+function anomalyScoreForDispatch(
+  detection: DispatchRingDetection,
+  evidenceJson: string,
+  now: number,
+): AnomalyScoreRow {
+  return {
+    id: `${detection.ring_id}:score:${now}`,
+    type: detection.type,
+    subject_type: 'ring',
+    subject_id: detection.ring_id,
+    severity: detection.severity,
+    score: detection.score,
+    window_start: now,
+    window_end: now,
+    evidence_json: evidenceJson,
+    status: 'open',
+    created_at: now,
+  };
+}
+
+function planReviewSimhashes(reviews: DispatchRingReview[], now: number): ReviewSimhashRow[] {
+  return reviews
+    .filter((review) => review.body && review.body.trim().length > 0)
+    .map((review) => ({
+      review_id: review.id,
+      minhash_json: JSON.stringify(minhashSignature(review.body ?? '')),
+      shingle_count: shingleCount(review.body ?? ''),
+      updated_at: now,
+    }));
 }
 
 function sixHourBucket(timestamp: number): number {

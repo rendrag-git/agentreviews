@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { generateSigningKeyPair } from '../lib/signing';
 import type { DetectorMaterializationPlan } from '../lib/detector-materialization';
-import { persistDetectorPlan, runMitigationRecovery } from './detection';
+import { persistDetectorPlan, runMitigationRecovery, runRingRecovery } from './detection';
 
 describe('detector persistence', () => {
   it('appends signed mitigation.apply entries before persisting active mitigations', async () => {
@@ -285,6 +285,27 @@ describe('mitigation recovery sweep', () => {
   });
 });
 
+describe('ring recovery sweep', () => {
+  it('clears stale active rings once their decayed score falls below the ring threshold', async () => {
+    const now = 1_780_000_000_000;
+    const db = new FakeRingRecoveryDb([
+      { id: 'ring-stale', score: 0.9, last_seen_at: now - 42 * 60 * 60 * 1000, status: 'active', cleared_at: null },
+    ]);
+
+    const result = await runRingRecovery({ DB: db as unknown as D1Database }, now);
+
+    expect(result).toEqual({ scanned: 1, cleared: 1 });
+    expect(db.rings.get('ring-stale')).toEqual(expect.objectContaining({
+      status: 'cleared',
+      cleared_at: now,
+    }));
+    expect(db.alerts.get('ring-stale')).toEqual({
+      status: 'dismissed',
+      cleared_at: now,
+    });
+  });
+});
+
 class FakeDetectionDb {
   readonly logEntries: Array<Record<string, unknown>> = [];
   readonly mitigations: Array<Record<string, unknown>> = [];
@@ -477,6 +498,67 @@ class FakeRecoveryDb {
                 actor: values[4],
                 created_at: values[5],
               });
+            },
+          };
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      },
+    };
+  }
+
+  batch(statements: Array<{ run?: () => Promise<unknown> }>) {
+    return Promise.all(statements.map((statement) => statement.run?.()));
+  }
+}
+
+interface RingRecoveryRow {
+  id: string;
+  score: number;
+  last_seen_at: number;
+  status: string;
+  cleared_at: number | null;
+}
+
+class FakeRingRecoveryDb {
+  readonly rings = new Map<string, RingRecoveryRow>();
+  readonly alerts = new Map<string, { status: string; cleared_at: number | null }>();
+
+  constructor(rows: RingRecoveryRow[]) {
+    for (const row of rows) {
+      this.rings.set(row.id, row);
+      this.alerts.set(row.id, { status: 'open', cleared_at: null });
+    }
+  }
+
+  prepare(sql: string) {
+    if (sql.includes('FROM rings r')) {
+      return {
+        all: async () => ({
+          results: [...this.rings.values()].filter((row) => row.status === 'active' && row.cleared_at === null),
+        }),
+      };
+    }
+    return {
+      bind: (...values: unknown[]) => {
+        if (sql.includes('UPDATE rings SET status')) {
+          return {
+            run: async () => {
+              const ring = this.rings.get(String(values[2]));
+              if (ring && ring.status === values[3]) {
+                ring.status = String(values[0]);
+                ring.cleared_at = Number(values[1]);
+              }
+            },
+          };
+        }
+        if (sql.includes('UPDATE alerts')) {
+          return {
+            run: async () => {
+              const alert = this.alerts.get(String(values[4]));
+              if (alert && alert.status === values[5]) {
+                alert.status = String(values[0]);
+                alert.cleared_at = Number(values[1]);
+              }
             },
           };
         }

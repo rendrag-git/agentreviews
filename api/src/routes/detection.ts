@@ -1,4 +1,5 @@
 import type { Env } from '../types';
+import type { DispatchRingReview } from '../lib/dispatch-rings';
 import { buildMitigationApplyLogEntries, buildMitigationClearLogEntries } from '../lib/mitigation-log';
 import {
   planDetectorMaterialization,
@@ -16,6 +17,8 @@ const RECOVERY_QUIET_MS = 24 * 60 * 60 * 1000;
 const RECOVERY_SCORE_HALF_LIFE_MS = 14 * 60 * 60 * 1000;
 const RECOVERY_PIN_MS = 30 * 24 * 60 * 60 * 1000;
 const RECOVERY_AUTO_CLEAR_REASON = 'auto_clear:score_below_threshold';
+const RING_RECOVERY_QUIET_MS = 24 * 60 * 60 * 1000;
+const RING_RECOVERY_SCORE_THRESHOLD = 0.3;
 
 interface MitigationRecoveryCandidate {
   alert_id: string;
@@ -57,6 +60,9 @@ export async function runDetectors(env: Env, epoch = Date.now()): Promise<Detect
   const reviews = reviewIds.length > 0
     ? await loadDetectionReviews(env, reviewIds, epoch - DETECTION_WINDOW_MS)
     : [];
+  const dispatchReviews = reviewIds.length > 0
+    ? await loadDetectionDispatchReviews(env, reviewIds, epoch - DETECTION_WINDOW_MS)
+    : [];
   const reviewActions = actionIds.length > 0
     ? await loadDetectionReviewActions(env, actionIds, epoch - DETECTION_WINDOW_MS)
     : [];
@@ -69,10 +75,50 @@ export async function runDetectors(env: Env, epoch = Date.now()): Promise<Detect
     logEntries: entries,
     reviews,
     reviewActions,
+    dispatchReviews,
   });
 
   await persistDetectorPlan(env, plan, epoch);
   return plan;
+}
+
+export async function runRingRecovery(
+  env: Env,
+  epoch = Date.now(),
+): Promise<{ scanned: number; cleared: number }> {
+  const result = await env.DB.prepare(
+    `SELECT
+       r.id,
+       r.score,
+       r.last_seen_at
+     FROM rings r
+     WHERE r.status = 'active'
+       AND r.cleared_at IS NULL
+     ORDER BY r.id ASC`,
+  )
+    .all<{ id: string; score: number; last_seen_at: number }>();
+  const rows = result.results || [];
+  const eligible = rows.filter((row) => {
+    if (epoch - row.last_seen_at < RING_RECOVERY_QUIET_MS) return false;
+    return decayedScore(row.score, row.last_seen_at, epoch) < RING_RECOVERY_SCORE_THRESHOLD;
+  });
+  if (eligible.length === 0) return { scanned: rows.length, cleared: 0 };
+
+  const statements = eligible.flatMap((row) => [
+    env.DB.prepare('UPDATE rings SET status = ?, cleared_at = ? WHERE id = ? AND status = ?')
+      .bind('cleared', epoch, row.id, 'active'),
+    env.DB.prepare(
+      `UPDATE alerts
+       SET status = ?, cleared_at = ?
+       WHERE type = ?
+         AND subject_type = ?
+         AND subject_id = ?
+         AND status = ?`,
+    ).bind('dismissed', epoch, 'dispatch.suspected', 'ring', row.id, 'open'),
+  ]);
+
+  await env.DB.batch(statements);
+  return { scanned: rows.length, cleared: eligible.length };
 }
 
 export async function runMitigationRecovery(
@@ -322,6 +368,61 @@ async function loadDetectionReviews(
   return reviews.results || [];
 }
 
+async function loadDetectionDispatchReviews(
+  env: Env,
+  reviewIds: string[],
+  windowStart: number,
+): Promise<DispatchRingReview[]> {
+  const reviewPlaceholders = reviewIds.map(() => '?').join(', ');
+  const affectedVenues = await env.DB.prepare(
+    `SELECT DISTINCT venue_id
+     FROM reviews
+     WHERE id IN (${reviewPlaceholders})`,
+  )
+    .bind(...reviewIds)
+    .all<{ venue_id: string }>();
+  const venueIds = (affectedVenues.results || []).map((row) => row.venue_id);
+  if (venueIds.length === 0) return [];
+
+  const venuePlaceholders = venueIds.map(() => '?').join(', ');
+  const result = await env.DB.prepare(
+    `SELECT
+       r.id,
+       r.venue_id,
+       r.agent_id,
+       r.body,
+       r.tags,
+       r.rating,
+       r.created_at,
+       a.created_at AS agent_created_at,
+       v.voucher_id AS vouch_ancestor_id,
+       le.conn_fp
+     FROM reviews r
+     JOIN agents a ON a.id = r.agent_id
+     LEFT JOIN vouches v ON v.vouchee_id = r.agent_id AND v.revoked_at IS NULL
+     LEFT JOIN log_entries le ON le.seq = r.log_seq
+     WHERE r.venue_id IN (${venuePlaceholders})
+       AND r.created_at >= ?
+       AND r.erased_at IS NULL
+       AND r.moderation_state IN ('visible', 'soft_hidden')
+     ORDER BY r.venue_id ASC, r.id ASC`,
+  )
+    .bind(...venueIds, windowStart)
+    .all<DispatchRingReview & { tags: string | null }>();
+  const rows = result.results || [];
+  const connFpCounts = new Map<string, number>();
+  for (const row of rows) {
+    if (!row.conn_fp) continue;
+    connFpCounts.set(row.conn_fp, (connFpCounts.get(row.conn_fp) ?? 0) + 1);
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    tags: parseTags(row.tags),
+    conn_fp_prevalence: row.conn_fp ? (connFpCounts.get(row.conn_fp) ?? 0) / Math.max(1, rows.length) : 1,
+  }));
+}
+
 function shouldAutoClearMitigation(candidate: MitigationRecoveryCandidate, epoch: number): boolean {
   return epoch - candidate.last_seen_at >= RECOVERY_QUIET_MS &&
     recoveryScore(candidate, epoch) < RECOVERY_CLEAR_THRESHOLD;
@@ -329,9 +430,13 @@ function shouldAutoClearMitigation(candidate: MitigationRecoveryCandidate, epoch
 
 function recoveryScore(candidate: MitigationRecoveryCandidate, epoch: number): number {
   const latestScore = Number.isFinite(candidate.latest_score) ? Number(candidate.latest_score) : 0;
-  const quietMs = Math.max(0, epoch - candidate.last_seen_at);
+  return decayedScore(latestScore, candidate.last_seen_at, epoch);
+}
+
+function decayedScore(score: number, lastSeenAt: number, epoch: number): number {
+  const quietMs = Math.max(0, epoch - lastSeenAt);
   const halfLives = quietMs / RECOVERY_SCORE_HALF_LIFE_MS;
-  return round(latestScore * Math.pow(0.5, halfLives));
+  return round(score * Math.pow(0.5, halfLives));
 }
 
 function round(value: number): number {
@@ -504,7 +609,62 @@ export async function persistDetectorPlan(
     ).bind(epoch, mitigation.review_id));
   }
 
+  for (const ring of plan.rings ?? []) {
+    statements.push(env.DB.prepare(
+      `INSERT INTO rings (
+         id, venue_id, status, severity, score, evidence_json, detected_at, last_seen_at, cleared_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+       ON CONFLICT(id) DO UPDATE
+       SET status = 'active',
+           severity = excluded.severity,
+           score = excluded.score,
+           evidence_json = excluded.evidence_json,
+           last_seen_at = excluded.last_seen_at,
+           cleared_at = NULL`,
+    ).bind(
+      ring.id,
+      ring.venue_id,
+      ring.status,
+      ring.severity,
+      ring.score,
+      ring.evidence_json,
+      ring.detected_at,
+      ring.last_seen_at,
+    ));
+  }
+
+  for (const member of plan.ringMembers ?? []) {
+    statements.push(env.DB.prepare(
+      `INSERT INTO ring_members (ring_id, agent_id, first_seen_at, last_seen_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(ring_id, agent_id) DO UPDATE
+       SET last_seen_at = excluded.last_seen_at`,
+    ).bind(member.ring_id, member.agent_id, member.first_seen_at, member.last_seen_at));
+  }
+
+  for (const simhash of plan.reviewSimhashes ?? []) {
+    statements.push(env.DB.prepare(
+      `INSERT INTO review_simhash (review_id, minhash_json, shingle_count, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(review_id) DO UPDATE
+       SET minhash_json = excluded.minhash_json,
+           shingle_count = excluded.shingle_count,
+           updated_at = excluded.updated_at`,
+    ).bind(simhash.review_id, simhash.minhash_json, simhash.shingle_count, simhash.updated_at));
+  }
+
   await env.DB.batch(statements);
+}
+
+function parseTags(value: string[] | string | null | undefined): string[] {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
 }
 
 function insertLogEntryStatement(env: Env, entry: LogEntry): D1PreparedStatement {
