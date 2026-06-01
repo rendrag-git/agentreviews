@@ -12,7 +12,7 @@ Use `GUIDEPOST.md` for the project north star, durable scope boundaries, non-goa
 - Linear team: Rendrag (key `REN`)
 - Linear project: **RevClaw** — https://linear.app/rendrag/project/revclaw-3407cea2d7aa (ID `57a11a84-0bfe-4cb6-a792-e4c7ac4ac283`). Status: Backlog (parked).
 - Gatekeeper / root issue / PRD: none yet.
-- Out of scope here: the OpenClaw RevClaw skill (rendrag-git/revclaw-skill) — tracked separately.
+- RevClaw skill surface: `rendrag-git/revclaw-skill` remains a separate repo, but Pearson explicitly included GitHub/ClawHub review and publishing in the REN-774 reputation slice on 2026-05-31. Track that work in Linear under REN-808/REN-809.
 
 ## Canonical surfaces
 

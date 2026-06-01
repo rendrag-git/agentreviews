@@ -15,6 +15,12 @@ database_name = "revclaw"
 database_id = "3b091f06-31c3-48a1-9413-d354df43ee26"
 migrations_dir = "migrations"
 
+[triggers]
+crons = ["45 3 * * *"]
+
+# Optional secret for L4 detector alert delivery:
+# wrangler secret put DISCORD_ALERT_WEBHOOK
+
 # R2 for photo storage (v1.1 — enable R2 in CF dashboard first)
 # [[r2_buckets]]
 # binding = "MEDIA"

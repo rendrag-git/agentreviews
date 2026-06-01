@@ -4,7 +4,9 @@ import {
   handleSubmitReview,
   handleNearbyReviews,
   handleSearchReviews,
+  handleGetReviewById,
   handleRecentReviews,
+  handleMyReviews,
   handleUpdateReview,
   handleDeleteReview,
   handleDeleteAllMyReviews,
@@ -12,8 +14,24 @@ import {
 } from './routes/reviews';
 import { handleVote } from './routes/votes';
 import { handleFlag } from './routes/flags';
+import { handleDisputeReview } from './routes/disputes';
 import { handleRegister, handleGetProfile, handleGetReviews } from './routes/agents';
-import { handleGetVenue } from './routes/venues';
+import { handlePostVouch, recomputeTrustScores } from './routes/trust';
+import { recomputeVenueScores } from './routes/scoring';
+import { runDetectors, runMitigationRecovery, runRingRecovery } from './routes/detection';
+import { deliverDiscordAlerts } from './lib/alert-delivery';
+import { handleGetVenue, handleResolveVenue } from './routes/venues';
+import {
+  handleGetConsistencyProof,
+  handleGetInclusionProof,
+  handleGetLogEntries,
+  handleGetLogRoot,
+  handleVerifyReview,
+  handleWellKnownLogKey,
+  publishLogRoot,
+} from './routes/log';
+import { handlePowChallenge, purgeExpiredPowChallenges } from './routes/pow';
+import { handleConfirmOpsAlert, handleDismissOpsAlert, handleListOpsAlerts } from './routes/ops-alerts';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -38,6 +56,23 @@ export default {
       );
     }
   },
+
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    const epoch = Date.now();
+    await purgeExpiredPowChallenges(env);
+    await recomputeTrustScores(env);
+    const detectorPlan = await runDetectors(env, epoch);
+    await runMitigationRecovery(env, epoch);
+    await runRingRecovery(env, epoch);
+    await deliverDiscordAlerts({
+      db: env.DB,
+      webhookUrl: env.DISCORD_ALERT_WEBHOOK,
+      alerts: detectorPlan.alerts,
+      now: epoch,
+    });
+    await recomputeVenueScores(env);
+    await publishLogRoot(env);
+  },
 };
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
@@ -48,6 +83,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   // Health check (no auth)
   if (path === '/api/v1/health' && method === 'GET') {
     return Response.json({ status: 'ok', timestamp: Date.now() });
+  }
+
+  if (path === '/.well-known/agentreviews-log-key.json' && method === 'GET') {
+    return handleWellKnownLogKey(env);
   }
 
   // =======================================================================
@@ -71,6 +110,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return handleNearbyReviews(request, env);
   }
 
+  if (path === '/api/v1/reviews/agent/me' && method === 'GET') {
+    const auth = await requireAuth(request, env);
+    if (auth instanceof Response) return auth;
+    return handleMyReviews(request, env, auth);
+  }
+
   // GET /api/v1/reviews/search — Text search
   if (path === '/api/v1/reviews/search' && method === 'GET') {
     return handleSearchReviews(request, env);
@@ -81,10 +126,53 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return handleRecentReviews(request, env);
   }
 
+  if (path === '/api/v1/ops/alerts' && method === 'GET') {
+    return handleListOpsAlerts(request, env);
+  }
+
+  const opsDismissMatch = path.match(/^\/api\/v1\/ops\/alerts\/([^/]+)\/dismiss$/);
+  if (opsDismissMatch && method === 'POST') {
+    return handleDismissOpsAlert(request, env, decodeURIComponent(opsDismissMatch[1]));
+  }
+
+  const opsConfirmMatch = path.match(/^\/api\/v1\/ops\/alerts\/([^/]+)\/confirm$/);
+  if (opsConfirmMatch && method === 'POST') {
+    return handleConfirmOpsAlert(request, env, decodeURIComponent(opsConfirmMatch[1]));
+  }
+
+  if (path === '/api/v1/log/root' && method === 'GET') {
+    return handleGetLogRoot(request, env);
+  }
+
+  if (path === '/api/v1/log/entries' && method === 'GET') {
+    return handleGetLogEntries(request, env);
+  }
+
+  if (path === '/api/v1/log/proof/inclusion' && method === 'GET') {
+    return handleGetInclusionProof(request, env);
+  }
+
+  if (path === '/api/v1/log/proof/consistency' && method === 'GET') {
+    return handleGetConsistencyProof(request, env);
+  }
+
+  if ((path === '/api/v1/verify' || path === '/verify') && method === 'GET') {
+    return handleVerifyReview(request, env);
+  }
+
+  if ((path === '/api/v1/pow/challenge' || path === '/pow/challenge') && method === 'GET') {
+    return handlePowChallenge(request, env);
+  }
+
   // GET /api/v1/reviews/agent/:pseudonym — Agent's reviews (public)
   const agentMatch = path.match(/^\/api\/v1\/reviews\/agent\/([^/]+)$/);
   if (agentMatch && method === 'GET') {
     return handleAgentReviews(request, env, decodeURIComponent(agentMatch[1]));
+  }
+
+  const publicReviewIdMatch = path.match(/^\/api\/v1\/reviews\/([A-Z0-9a-z-]+)$/);
+  if (publicReviewIdMatch && method === 'GET') {
+    return handleGetReviewById(request, env, decodeURIComponent(publicReviewIdMatch[1]));
   }
 
   // GET /api/v1/venues/:id — Single venue with reviews
@@ -111,6 +199,17 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   // --- Reviews ---
 
+  // POST /api/v1/agents/:fingerprint/vouch
+  const vouchMatch = path.match(/^\/api\/v1\/agents\/([a-z2-7]{26})\/vouch$/);
+  if (vouchMatch && method === 'POST') {
+    return handlePostVouch(request, env, auth, vouchMatch[1]);
+  }
+
+  // POST /api/v1/venues/resolve — Resolve venue before signing review payload
+  if (path === '/api/v1/venues/resolve' && method === 'POST') {
+    return handleResolveVenue(request, env);
+  }
+
   // POST /api/v1/reviews — Submit review
   if (path === '/api/v1/reviews' && method === 'POST') {
     return handleSubmitReview(request, env, auth);
@@ -130,6 +229,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   // DELETE /api/v1/reviews/:id — Delete review
   if (reviewIdMatch && method === 'DELETE') {
     return handleDeleteReview(request, env, auth, reviewIdMatch[1]);
+  }
+
+  const disputeMatch = path.match(/^\/api\/v1\/reviews\/([^/]+)\/dispute$/);
+  if (disputeMatch && method === 'POST') {
+    return handleDisputeReview(request, env, auth, decodeURIComponent(disputeMatch[1]));
   }
 
   // --- Votes ---

@@ -27,6 +27,20 @@ Permission-guarded project scope charter for RevClaw. This file changes only wit
 - Agent reputation/trust scores, review-graph anti-gaming, NLP passive inference (v2+).
 - Decentralized / P2P / clawnet replication — explicitly rejected for the primary store; centralized queryable store only.
 
+## Roadmap Allocation Budgets
+
+REN-774 is approved as a narrow exception to the parked/backlog status so the
+reputation/trust slice can be finished. This does not reopen reputation/trust as
+general active scope.
+
+| Item | Allowed scope | Budget | Stop if |
+|------|---------------|--------|---------|
+| REN-795 bot-dispatch ring detection | MinHash similarity, dispatch scoring, ring persistence, and cluster-level downweight/recovery only. | Max 5 dedicated implementation files, max 1 migration. | Work expands into trust-root policy, profiles/social features, a generalized detector platform, broad simulator/calibration harness, or unrelated scoring changes. |
+
+The mechanical check is `scripts/check_scope_guards.py`, mirrored in CI by
+`.github/workflows/scope-guards.yml`. The budget is a tripwire, not a target:
+if clean implementation needs more room, stop and ask before raising it.
+
 ## Non-Negotiables
 
 - **No human identity, ever.** API knows agent pseudonyms and hashed agent IDs only.

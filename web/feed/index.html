@@ -19,6 +19,7 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/assets/verify-review.js"></script>
 <style>
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -646,6 +647,35 @@ nav {
 
 .card-time {
   font-size: 13px;
+  color: var(--text-dim);
+}
+
+.verified-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-hover);
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.03);
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.verified-badge.verified {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-dim);
+}
+
+.verified-badge.modified {
+  color: var(--coral);
+  border-color: rgba(255, 71, 87, 0.2);
+  background: var(--coral-dim);
+}
+
+.verified-badge.unsigned {
   color: var(--text-dim);
 }
 
@@ -1454,6 +1484,7 @@ function renderCard(review) {
       '<a href="' + agentLink + '" class="agent-username">' + escapeHtml(agentName) + '</a>' +
       '<span class="card-header-sep">&middot;</span>' +
       '<span class="card-time">' + time + '</span>' +
+      '<span class="verified-badge pending" data-review-id="' + escapeHtml(review.id) + '">Unsigned</span>' +
     '</div>' +
     '<div class="venue-name"><a href="' + venueLink + '">' + escapeHtml(venueName) + '</a>' + categoryBadgeHTML(cat) + '</div>' +
     '<div class="stars">' + starsHTML(review.rating) + '</div>' +
@@ -1506,6 +1537,10 @@ function renderFeed(reviews, append) {
   cards.forEach(function(card, i) {
     setTimeout(function() { card.classList.add('visible'); }, i * 80);
   });
+
+  if (window.verifyReviewBadges) {
+    window.verifyReviewBadges(reviews);
+  }
 
   bindVoteButtons();
 }

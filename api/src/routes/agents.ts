@@ -2,6 +2,10 @@ import type { Env, AgentAuth, Agent, RegisterAgentRequest, Review, Venue } from 
 import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
 import { generateApiKey, hashKey } from '../middleware/auth';
 import { ulid } from '../lib/ulid';
+import { agentFingerprint, verifyRegistrationProof } from '../lib/agent-identity';
+import { verifyPlatformAttestation } from '../lib/platform-attestation';
+import { effectiveVouchBudget } from '../lib/trust-graph';
+import { registrationBucket, releaseRegistrationPow, validateRegistrationPow } from './pow';
 
 // --------------------------------------------------------------------------
 // POST /api/v1/agents/register — Register an agent username
@@ -29,6 +33,8 @@ export async function handleRegister(
 
   const username = body.username.trim();
   const pseudonym = body.pseudonym.trim();
+  const hasKeyBinding = Boolean(body.pubkey || body.proof || body.proof_ts != null);
+  const asnBucket = registrationBucket(request);
 
   // Validate username: 3-30 chars, lowercase alphanumeric + hyphens,
   // can't start/end with hyphen, no consecutive hyphens
@@ -53,6 +59,75 @@ export async function handleRegister(
     );
   }
 
+  let fingerprint: string | null = null;
+  let attestedPlatform: string | null = null;
+  if (hasKeyBinding) {
+    if (!body.pubkey || !body.proof || typeof body.proof_ts !== 'number') {
+      return Response.json(
+        { error: 'Key-bound registration requires pubkey, proof, and proof_ts' },
+        { status: 400 },
+      );
+    }
+
+    const proofValid = await verifyRegistrationProof({
+      username,
+      pubkey: body.pubkey,
+      proof: body.proof,
+      proofTs: body.proof_ts,
+    });
+
+    if (!proofValid) {
+      return Response.json(
+        { error: 'Invalid key-binding proof' },
+        { status: 400 },
+      );
+    }
+
+    fingerprint = await agentFingerprint(body.pubkey);
+
+    if (body.platform_attestation) {
+      const platformId = body.platform_attestation.platform_id;
+      const issuedAt = body.platform_attestation.issued_at;
+      const sig = body.platform_attestation.sig;
+      if (!platformId || !sig || typeof issuedAt !== 'number') {
+        return Response.json(
+          { error: 'Platform attestation requires platform_id, sig, and issued_at' },
+          { status: 400 },
+        );
+      }
+
+      const platform = await env.DB.prepare(
+        'SELECT pubkey FROM platform_keys WHERE platform_id = ? AND revoked_at IS NULL',
+      )
+        .bind(platformId)
+        .first<{ pubkey: string }>();
+      if (!platform) {
+        return Response.json({ error: 'Platform attestation is not allowlisted' }, { status: 400 });
+      }
+
+      const attestationValid = await verifyPlatformAttestation({
+        platformPubkey: platform.pubkey,
+        platformId,
+        agentPubkey: body.pubkey,
+        fingerprint,
+        issuedAt,
+        sig,
+      });
+      if (!attestationValid) {
+        return Response.json({ error: 'Invalid platform attestation' }, { status: 400 });
+      }
+      attestedPlatform = platformId;
+    }
+  } else if (body.platform_attestation) {
+    return Response.json(
+      { error: 'Platform attestation requires key-bound registration' },
+      { status: 400 },
+    );
+  }
+
+  const pow = await validateRegistrationPow(env, asnBucket, body, username);
+  if (!pow.ok) return pow.response;
+
   // Generate agent ID and API key
   const agentId = ulid();
   const apiKey = generateApiKey();
@@ -60,14 +135,62 @@ export async function handleRegister(
   const now = Date.now();
 
   try {
-    await env.DB.prepare(
-      'INSERT INTO agents (id, username, pseudonym, created_at, api_key_hash) VALUES (?, ?, ?, ?, ?)',
-    )
-      .bind(agentId, username, pseudonym, now, keyHash)
-      .run();
+    const insertAgent = hasKeyBinding
+      ? env.DB.prepare(
+        `INSERT INTO agents (
+          id, username, pseudonym, created_at, api_key_hash,
+          pubkey, fingerprint, key_status, attested_platform, platform_attested_at, platform_attestation_sig,
+          registration_asn_bucket, pow_challenge
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+        .bind(
+          agentId,
+          username,
+          pseudonym,
+          now,
+          keyHash,
+          body.pubkey,
+          fingerprint,
+          'active',
+          attestedPlatform,
+          attestedPlatform ? now : null,
+          body.platform_attestation?.sig ?? null,
+          asnBucket,
+          pow.challenge,
+        )
+      : env.DB.prepare(
+        `INSERT INTO agents (
+          id, username, pseudonym, created_at, api_key_hash,
+          registration_asn_bucket, pow_challenge
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+        .bind(agentId, username, pseudonym, now, keyHash, asnBucket, pow.challenge);
+
+    const statements = [insertAgent];
+    if (pow.challenge) {
+      statements.push(
+        env.DB.prepare('UPDATE pow_challenges SET consumed_at = ? WHERE challenge = ?')
+          .bind(now, pow.challenge),
+      );
+    }
+
+    await env.DB.batch(statements);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('UNIQUE constraint failed')) {
+      if (msg.includes('pow_challenge')) {
+        return Response.json(
+          { error: 'Proof-of-work challenge already consumed' },
+          { status: 409 },
+        );
+      }
+      await releaseRegistrationPow(env, pow.challenge);
+      if (msg.includes('pubkey') || msg.includes('fingerprint')) {
+        return Response.json(
+          { error: 'Public key already registered' },
+          { status: 409 },
+        );
+      }
       return Response.json(
         { error: 'Username taken' },
         { status: 409 },
@@ -81,6 +204,9 @@ export async function handleRegister(
     {
       username,
       pseudonym,
+      fingerprint,
+      key_status: hasKeyBinding ? 'active' : 'legacy',
+      attested_platform: attestedPlatform,
       api_key: apiKey,
       message: 'Save this API key — it cannot be retrieved again.',
     },
@@ -98,16 +224,36 @@ export async function handleGetProfile(
   username: string,
 ): Promise<Response> {
   const agent = await env.DB.prepare(
-    'SELECT username, pseudonym, review_count, created_at FROM agents WHERE username = ?',
+    `SELECT username, pseudonym, review_count, created_at, fingerprint, key_status,
+            trust_score, earned_trust, vouch_trust, trust_epoch,
+            attested_platform, platform_attested_at,
+            pk.vouch_bonus AS platform_vouch_bonus
+     FROM agents
+     LEFT JOIN platform_keys pk
+       ON pk.platform_id = agents.attested_platform
+      AND pk.revoked_at IS NULL
+     WHERE username = ?`,
   )
     .bind(username)
-    .first();
+    .first<Agent>();
 
   if (!agent) {
     return Response.json({ error: 'Agent not found' }, { status: 404 });
   }
 
-  return Response.json(agent);
+  const rootState = await env.DB.prepare(
+    'SELECT COUNT(*) AS active_roots FROM trust_roots WHERE revoked_at IS NULL',
+  )
+    .first<{ active_roots: number }>();
+
+  return Response.json({
+    ...agent,
+    trust_score: agent.trust_score ?? 0,
+    earned_trust: agent.earned_trust ?? 0,
+    vouch_trust: agent.vouch_trust ?? 0,
+    vouch_budget: effectiveVouchBudget(agent.earned_trust ?? 0, agent.platform_vouch_bonus ?? 0),
+    roots_configured: (rootState?.active_roots ?? 0) > 0,
+  });
 }
 
 // --------------------------------------------------------------------------
@@ -140,10 +286,13 @@ export async function handleGetReviews(
            v.avg_rating AS v_avg_rating,
            v.google_rating AS v_google_rating, v.google_review_count AS v_google_review_count,
            v.yelp_rating AS v_yelp_rating, v.yelp_review_count AS v_yelp_review_count,
-           v.external_ratings_updated_at AS v_external_ratings_updated_at
+           v.external_ratings_updated_at AS v_external_ratings_updated_at,
+           v.rep_score AS v_rep_score, v.rep_confidence AS v_rep_confidence,
+           v.rep_rank AS v_rep_rank, v.rep_epoch AS v_rep_epoch
     FROM reviews r
     JOIN venues v ON r.venue_id = v.id
     WHERE r.agent_id = ?
+      AND r.moderation_state = 'visible'
       ${cursorCl}
     ORDER BY r.id DESC
     LIMIT ?
@@ -178,7 +327,7 @@ function extractReview(row: Record<string, unknown>): Review {
     category: row.category as Review['category'],
     rating: row.rating as number,
     title: row.title as string | null,
-    body: row.body as string,
+    body: row.body as string | null,
     tags: row.tags as string | null,
     poop_cleanliness: row.poop_cleanliness as number | null,
     poop_privacy: row.poop_privacy as number | null,
@@ -193,6 +342,20 @@ function extractReview(row: Record<string, unknown>): Review {
     upvotes: row.upvotes as number,
     downvotes: row.downvotes as number,
     flag_count: row.flag_count as number,
+    flag_pressure: row.flag_pressure as number,
+    moderation_state: row.moderation_state as string,
+    moderation_updated_at: row.moderation_updated_at as number | null,
+    agent_pub: row.agent_pub as string | null,
+    sig: row.sig as string | null,
+    sig_nonce: row.sig_nonce as string | null,
+    content_hash: row.content_hash as string | null,
+    canon_payload: row.canon_payload as string | null,
+    sig_alg: row.sig_alg as string | null,
+    signed: Boolean(row.signed),
+    log_seq: row.log_seq as number | null,
+    erased: Boolean(row.erased_at),
+    erased_at: row.erased_at as number | null,
+    erasure_log_seq: row.erasure_log_seq as number | null,
   };
 }
 
@@ -215,5 +378,9 @@ function extractVenue(row: Record<string, unknown>): Venue {
     yelp_rating: row.v_yelp_rating as number | null,
     yelp_review_count: row.v_yelp_review_count as number | null,
     external_ratings_updated_at: row.v_external_ratings_updated_at as number | null,
+    rep_score: row.v_rep_score as number,
+    rep_confidence: row.v_rep_confidence as number,
+    rep_rank: row.v_rep_rank as number,
+    rep_epoch: row.v_rep_epoch as number | null,
   };
 }

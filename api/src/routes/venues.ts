@@ -1,5 +1,53 @@
 import type { Env, Review, Venue } from '../types';
-import { parsePagination, cursorClause, nextCursor } from '../lib/pagination';
+import { parsePagination, nextScoreCursor, scoreCursorClause } from '../lib/pagination';
+import { resolveVenue } from '../lib/venue-dedup';
+
+// --------------------------------------------------------------------------
+// POST /api/v1/venues/resolve — Resolve or create a canonical venue id
+// --------------------------------------------------------------------------
+
+export async function handleResolveVenue(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const body = await request.json<{
+    venue_name?: string;
+    lat?: number;
+    lng?: number;
+    external_id?: string;
+    venue_external_id?: string;
+    city?: string;
+    region?: string;
+    country?: string;
+    google_rating?: number;
+    google_review_count?: number;
+    yelp_rating?: number;
+    yelp_review_count?: number;
+  }>();
+
+  if (!body.venue_name || body.lat == null || body.lng == null) {
+    return Response.json(
+      { error: 'Missing required fields: venue_name, lat, lng' },
+      { status: 400 },
+    );
+  }
+
+  const venue = await resolveVenue(env, {
+    venue_name: body.venue_name,
+    lat: body.lat,
+    lng: body.lng,
+    external_id: body.external_id ?? body.venue_external_id,
+    city: body.city,
+    region: body.region,
+    country: body.country,
+    google_rating: body.google_rating,
+    google_review_count: body.google_review_count,
+    yelp_rating: body.yelp_rating,
+    yelp_review_count: body.yelp_review_count,
+  });
+
+  return Response.json(venue);
+}
 
 // --------------------------------------------------------------------------
 // GET /api/v1/venues/:id — Single venue with reviews
@@ -22,15 +70,16 @@ export async function handleGetVenue(
   // Fetch paginated reviews for this venue
   const url = new URL(request.url);
   const { cursor, limit } = parsePagination(url);
-  const { clause: cursorCl, binds: cursorBinds } = cursorClause(cursor, 'r.id');
+  const { clause: cursorCl, binds: cursorBinds } = scoreCursorClause(cursor, 'COALESCE(rw.decayed_weight, 0)', 'r.id');
 
   const sql = `
-    SELECT r.*
+    SELECT r.*, COALESCE(rw.decayed_weight, 0) AS review_rank_weight
     FROM reviews r
+    LEFT JOIN review_weights rw ON rw.review_id = r.id
     WHERE r.venue_id = ?
-      AND r.flag_count < 3
+      AND r.moderation_state = 'visible'
       ${cursorCl}
-    ORDER BY r.created_at DESC, r.id DESC
+    ORDER BY COALESCE(rw.decayed_weight, 0) DESC, r.id DESC
     LIMIT ?
   `;
 
@@ -46,7 +95,7 @@ export async function handleGetVenue(
     category: row.category as Review['category'],
     rating: row.rating as number,
     title: row.title as string | null,
-    body: row.body as string,
+    body: row.body as string | null,
     tags: row.tags as string | null,
     poop_cleanliness: row.poop_cleanliness as number | null,
     poop_privacy: row.poop_privacy as number | null,
@@ -61,11 +110,26 @@ export async function handleGetVenue(
     upvotes: row.upvotes as number,
     downvotes: row.downvotes as number,
     flag_count: row.flag_count as number,
+    flag_pressure: row.flag_pressure as number,
+    moderation_state: row.moderation_state as string,
+    moderation_updated_at: row.moderation_updated_at as number | null,
+    agent_pub: row.agent_pub as string | null,
+    sig: row.sig as string | null,
+    sig_nonce: row.sig_nonce as string | null,
+    content_hash: row.content_hash as string | null,
+    canon_payload: row.canon_payload as string | null,
+    sig_alg: row.sig_alg as string | null,
+    signed: Boolean(row.signed),
+    log_seq: row.log_seq as number | null,
+    erased: Boolean(row.erased_at),
+    erased_at: row.erased_at as number | null,
+    erasure_log_seq: row.erasure_log_seq as number | null,
+    review_rank_weight: row.review_rank_weight as number,
   }));
 
   return Response.json({
     venue,
     reviews,
-    next_cursor: nextCursor(reviews, limit),
+    next_cursor: nextScoreCursor(reviews, limit, (review) => review.review_rank_weight ?? 0),
   });
 }

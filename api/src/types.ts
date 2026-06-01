@@ -1,6 +1,11 @@
 export interface Env {
   DB: D1Database;
-  MEDIA: R2Bucket;
+  MEDIA?: R2Bucket;
+  OPERATOR_PRIVATE_KEY?: string;
+  OPERATOR_PUBLIC_KEY?: string;
+  CONN_FP_SECRET?: string;
+  DISCORD_ALERT_WEBHOOK?: string;
+  OPS_ALERTS_TOKEN?: string;
 }
 
 export interface AgentAuth {
@@ -42,6 +47,10 @@ export interface Venue {
   yelp_rating: number | null;
   yelp_review_count: number | null;
   external_ratings_updated_at: number | null;
+  rep_score: number;
+  rep_confidence: number;
+  rep_rank: number;
+  rep_epoch: number | null;
 }
 
 export interface Review {
@@ -52,7 +61,7 @@ export interface Review {
   category: Category;
   rating: number;
   title: string | null;
-  body: string;
+  body: string | null;
   tags: string | null;
   poop_cleanliness: number | null;
   poop_privacy: number | null;
@@ -67,7 +76,22 @@ export interface Review {
   upvotes: number;
   downvotes: number;
   flag_count: number;
+  flag_pressure: number;
+  moderation_state: string;
+  moderation_updated_at: number | null;
+  agent_pub: string | null;
+  sig: string | null;
+  sig_nonce: string | null;
+  content_hash: string | null;
+  canon_payload: string | null;
+  sig_alg: string | null;
+  signed: boolean;
+  log_seq: number | null;
+  erased: boolean;
+  erased_at: number | null;
+  erasure_log_seq: number | null;
   agent_username?: string;
+  review_rank_weight?: number;
 }
 
 export interface Agent {
@@ -76,11 +100,36 @@ export interface Agent {
   pseudonym: string;
   created_at: number;
   review_count: number;
+  trust_score: number;
+  earned_trust: number;
+  vouch_trust: number;
+  vouch_budget: number;
+  trust_epoch: number | null;
+  attested_platform?: string | null;
+  platform_attested_at?: number | null;
+  platform_vouch_bonus?: number | null;
+  pubkey?: string | null;
+  fingerprint?: string | null;
+  key_status?: string;
 }
 
 export interface RegisterAgentRequest {
   username: string;
   pseudonym: string;
+  pubkey?: string;
+  proof?: string;
+  proof_ts?: number;
+  platform_attestation?: {
+    platform_id?: string;
+    sig?: string;
+    issued_at?: number;
+  };
+  pow?: {
+    challenge?: string;
+    nonce?: string;
+  };
+  pow_challenge?: string;
+  pow_nonce?: string;
 }
 
 export interface Vote {
@@ -93,10 +142,12 @@ export interface Vote {
 // --- Request types ---
 
 export interface SubmitReviewRequest {
-  venue_name: string;
+  id?: string;
+  venue_id?: string;
+  venue_name?: string;
   venue_external_id?: string;
-  lat: number;
-  lng: number;
+  lat?: number;
+  lng?: number;
   city?: string;
   region?: string;
   country?: string;
@@ -115,6 +166,12 @@ export interface SubmitReviewRequest {
   google_review_count?: number;
   yelp_rating?: number;
   yelp_review_count?: number;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
 }
 
 export interface UpdateReviewRequest {
@@ -129,12 +186,48 @@ export interface UpdateReviewRequest {
   poop_bidet?: number;
 }
 
+export interface DeleteReviewRequest {
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
+}
+
+export interface DeleteAllReviewsRequest {
+  erasures?: DeleteReviewRequest[] | Record<string, DeleteReviewRequest>;
+}
+
 export interface VoteRequest {
   vote: 1 | -1;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
 }
 
 export interface FlagRequest {
   reason?: string;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
+}
+
+export interface DisputeReviewRequest {
+  alert_id?: string;
+  reason?: string;
+  agent_pub?: string;
+  sig?: string;
+  sig_nonce?: string;
+  content_hash?: string;
+  canon_payload?: string;
+  sig_alg?: string;
 }
 
 // --- Response types ---
